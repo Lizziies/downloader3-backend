@@ -20,6 +20,8 @@ import json
 import sqlite3
 import secrets
 import datetime
+import smtplib
+from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
 from flask import Flask, request, jsonify
@@ -38,6 +40,16 @@ PAYPAL_BASE = ("https://api-m.paypal.com" if PAYPAL_MODE == "live"
 # Server nicht — nur du hast Zugriff auf die Render-Umgebungsvariablen).
 OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "")
 OWNER_EMAILS = {"felixwerther1@gmail.com", "lisa.werther@proton.me"}
+
+# 📧 E-Mail-Versand: genau dasselbe Prinzip — die App fragt diesen Server,
+# der Server verschickt die E-Mail mit SEINEN eigenen (nur hier
+# hinterlegten) SMTP-Zugangsdaten. Kein Passwort im verteilten Code.
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+_email_attempts = {}  # einfacher Schutz gegen Missbrauch/Spam
 
 # Verfügbare Pakete: Preis in EUR + wie viele Tage Premium es gibt
 # ("forever" = unbegrenzt). Passe Preise/Namen hier nach Belieben an.
@@ -218,6 +230,57 @@ def verify_owner():
     if password == OWNER_PASSWORD:
         return jsonify({"ok": True})
     return jsonify({"ok": False}), 401
+
+
+@app.route("/api/send-code", methods=["POST", "OPTIONS"])
+def send_code():
+    """📧 Verschickt eine Verifizierungs-E-Mail über die EIGENEN
+    SMTP-Zugangsdaten dieses Servers. Die App selbst kennt kein Passwort —
+    sie schickt nur E-Mail-Adresse + Code hierher."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    to_addr = (data.get("to") or "").strip()
+    code = (data.get("code") or "").strip()
+    subject = data.get("subject") or "Your verification code is {code}"
+    body = data.get("body") or "Your code: {code}"
+
+    if "@" not in to_addr or "." not in to_addr.split("@")[-1]:
+        return jsonify({"ok": False, "error": "invalid email"}), 400
+    if not code or len(code) > 12:
+        return jsonify({"ok": False, "error": "invalid code"}), 400
+
+    # Missbrauchsschutz: max. 5 E-Mails pro Adresse pro Stunde
+    now = datetime.datetime.now()
+    attempts = [t for t in _email_attempts.get(to_addr, [])
+               if (now - t).total_seconds() < 3600]
+    if len(attempts) >= 5:
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    attempts.append(now)
+    _email_attempts[to_addr] = attempts
+
+    if not SMTP_USER or not SMTP_PASSWORD:
+        return jsonify({"ok": False, "error": "smtp not configured"}), 503
+
+    try:
+        subject = subject.replace("{code}", code)
+        body = body.replace("{code}", code)
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_addr
+
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+            server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
+        server.quit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/", methods=["GET"])
