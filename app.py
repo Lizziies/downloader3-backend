@@ -33,6 +33,12 @@ PAYPAL_MODE = os.environ.get("PAYPAL_MODE", "sandbox")  # "sandbox" oder "live"
 PAYPAL_BASE = ("https://api-m.paypal.com" if PAYPAL_MODE == "live"
               else "https://api-m.sandbox.paypal.com")
 
+# 👑 Owner-Login: das ECHTE Passwort steht NUR hier als Umgebungsvariable,
+# niemals im main.py der App (die App wird öffentlich verteilt, dieser
+# Server nicht — nur du hast Zugriff auf die Render-Umgebungsvariablen).
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "")
+OWNER_EMAILS = {"felixwerther1@gmail.com", "lisa.werther@proton.me"}
+
 # Verfügbare Pakete: Preis in EUR + wie viele Tage Premium es gibt
 # ("forever" = unbegrenzt). Passe Preise/Namen hier nach Belieben an.
 PLANS = {
@@ -180,6 +186,38 @@ def redeem():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "days": days})
+
+
+_owner_attempts = {}  # simple In-Memory-Schutz gegen wiederholtes Ausprobieren
+
+
+@app.route("/api/verify-owner", methods=["POST", "OPTIONS"])
+def verify_owner():
+    """👑 Prüft ein Owner-Login. Das echte Passwort steckt nur in der
+    Umgebungsvariable OWNER_PASSWORD auf diesem Server — steht NIRGENDS
+    im main.py der App, die öffentlich verteilt wird."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    # Einfacher Schutz: max. 5 Versuche pro E-Mail alle 10 Minuten
+    now = datetime.datetime.now()
+    attempts = [t for t in _owner_attempts.get(email, [])
+               if (now - t).total_seconds() < 600]
+    if len(attempts) >= 5:
+        return jsonify({"ok": False, "error": "too many attempts"}), 429
+    attempts.append(now)
+    _owner_attempts[email] = attempts
+
+    if email not in OWNER_EMAILS:
+        return jsonify({"ok": False}), 403
+    if not OWNER_PASSWORD:
+        return jsonify({"ok": False, "error": "not configured"}), 503
+    if password == OWNER_PASSWORD:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False}), 401
 
 
 @app.route("/", methods=["GET"])
