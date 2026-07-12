@@ -582,6 +582,24 @@ T = {
         "cloud_error": "Fehlgeschlagen",
         "cloud_restore_confirm": "Das überschreibt deine aktuellen lokalen Einstellungen/Verlauf mit der gespeicherten Cloud-Version. Fortfahren?",
         "cloud_found_offer": "Für dieses Konto wurde eine Cloud-Sicherung von einem anderen Gerät gefunden! Jetzt wiederherstellen (Einstellungen, Verlauf, Favoriten, Abos)?",
+        "gift_title": "Premium an eine E-Mail verschenken",
+        "gift_hint": "Funktioniert auch für Leute, die die App noch nie genutzt haben — sobald sie sich mit dieser E-Mail registrieren/anmelden, ist ihr Premium automatisch da. Sie bekommen außerdem eine zweisprachige Glückwunsch-Mail (falls SMTP eingerichtet ist).",
+        "gift_email_ph": "E-Mail-Adresse der beschenkten Person",
+        "gift_owner_pw_ph": "Dein Owner-Passwort (zur Bestätigung)",
+        "gift_send": "Verschenken",
+        "gift_sending": "Wird verschenkt...",
+        "gift_ok": "Premium erfolgreich verschenkt!",
+        "gift_ok_no_email": "Glückwunsch-Mail konnte nicht verschickt werden, Premium ist aber trotzdem aktiv",
+        "gift_bad_email": "Bitte eine gültige E-Mail-Adresse eingeben.",
+        "gift_need_password": "Bitte dein Owner-Passwort eingeben.",
+        "gift_no_backend": "Keine Server-Adresse eingetragen (siehe oben).",
+        "gift_wrong_password": "Falsches Owner-Passwort.",
+        "gift_failed": "Fehlgeschlagen — Serververbindung prüfen.",
+        "days_label": "Tage",
+        "forever_label": "Für immer",
+        "gift_browse_all": "Alle weltweiten Nutzer anzeigen",
+        "gift_show_list": "Liste anzeigen",
+        "gift_no_accounts": "Noch keine Nutzer gefunden — sobald sich jemand irgendwo anmeldet, taucht die E-Mail hier auf.",
         "smtp_private_hint": "🔑 Willst du diese Zugangsdaten (inkl. Passwort) mit auf einen neuen PC nehmen, ohne alles neu abzutippen? Exportiere sie in eine Datei, die NUR du behältst — nicht auf GitHub hochladen, nicht teilen, nicht in die App-ZIP legen!",
         "smtp_export_private": "Zugangsdaten exportieren (privat!)",
         "smtp_import_private": "Zugangsdaten importieren",
@@ -953,6 +971,24 @@ T = {
         "cloud_error": "Failed",
         "cloud_restore_confirm": "This will overwrite your current local settings/history with the saved cloud version. Continue?",
         "cloud_found_offer": "A cloud backup from another device was found for this account! Restore it now (settings, history, favorites, subscriptions)?",
+        "gift_title": "Gift Premium to an email address",
+        "gift_hint": "Works even for people who have never used the app — as soon as they register/log in with this email, their Premium is automatically there. They'll also get a bilingual congratulations email (if SMTP is set up).",
+        "gift_email_ph": "Recipient email address",
+        "gift_owner_pw_ph": "Your owner password (to confirm)",
+        "gift_send": "Gift it",
+        "gift_sending": "Gifting...",
+        "gift_ok": "Premium gifted successfully!",
+        "gift_ok_no_email": "Couldn't send the congratulations email, but Premium is active regardless",
+        "gift_bad_email": "Please enter a valid email address.",
+        "gift_need_password": "Please enter your owner password.",
+        "gift_no_backend": "No server address configured (see above).",
+        "gift_wrong_password": "Wrong owner password.",
+        "gift_failed": "Failed — check the server connection.",
+        "days_label": "days",
+        "forever_label": "Forever",
+        "gift_browse_all": "Show all worldwide users",
+        "gift_show_list": "Show list",
+        "gift_no_accounts": "No users found yet — as soon as someone logs in anywhere, their email shows up here.",
         "smtp_private_hint": "🔑 Want to bring these credentials (incl. password) to a new PC without retyping everything? Export them to a file that ONLY you keep — never upload to GitHub, never share, never put in the app ZIP!",
         "smtp_export_private": "Export credentials (private!)",
         "smtp_import_private": "Import credentials",
@@ -5519,6 +5555,128 @@ class App(ctk.CTk):
         self.btn(win, text="✓ OK", width=140, command=close).pack(
             pady=(0, 20))
 
+    def show_worldwide_users_dialog(self, gift_email_e, gift_pw_e):
+        """🌍 Zeigt ALLE E-Mail-Adressen weltweit, die schon mit der App
+        interagiert haben (Login, Kauf, ...) — geschützt durch das
+        Owner-Passwort. Klick auf 🎁 bei einer Zeile übernimmt die
+        E-Mail direkt ins Verschenk-Formular."""
+        win = ctk.CTkToplevel(self)
+        win.title(APP_NAME)
+        win.geometry("480x480")
+        win.resizable(False, False)
+        win.grab_set()
+        card_bg = self.tint(2)
+        if card_bg:
+            win.configure(fg_color=card_bg)
+
+        ctk.CTkLabel(win, text="🌍 " + self.t("gift_browse_all"),
+                     font=self.font(size=16, weight="bold"),
+                     text_color=self.accent["main"]).pack(pady=(20, 10))
+
+        pw_row = ctk.CTkFrame(win, fg_color="transparent")
+        pw_row.pack(padx=20, pady=(0, 10), fill="x")
+        pw_e = ctk.CTkEntry(pw_row,
+                            placeholder_text=self.t("gift_owner_pw_ph"),
+                            show="•", height=36, corner_radius=self.radius)
+        pw_e.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        if gift_pw_e.get():
+            pw_e.insert(0, gift_pw_e.get())
+
+        list_frame = ctk.CTkScrollableFrame(
+            win, corner_radius=self.radius, height=270, **self.card_kw(2),
+            scrollbar_button_color=self.scrollbar_color(),
+            scrollbar_button_hover_color=self._mix(
+                self.scrollbar_color(), "#000000", 0.2))
+        list_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        status_lbl = ctk.CTkLabel(win, text="", font=self.font(size=11))
+        status_lbl.pack(pady=(0, 14))
+
+        def render_list(accounts):
+            for w in list_frame.winfo_children():
+                w.destroy()
+            if not accounts:
+                ctk.CTkLabel(list_frame, text=self.t("gift_no_accounts"),
+                            text_color=self.muted()).pack(pady=10)
+            for acc in accounts:
+                row = ctk.CTkFrame(list_frame, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+                mark = "★" if acc.get("premium_until") else "·"
+                ctk.CTkLabel(
+                    row, text=f"{mark} {acc['email']}", anchor="w",
+                    text_color=self.text_on(2) or None).pack(
+                        side="left", fill="x", expand=True)
+
+                def quick_gift(email=acc["email"]):
+                    pw_now = pw_e.get()
+                    gift_email_e.delete(0, "end")
+                    gift_email_e.insert(0, email)
+                    gift_pw_e.delete(0, "end")
+                    gift_pw_e.insert(0, pw_now)
+                    win.destroy()
+
+                ctk.CTkButton(row, text="🎁", width=36, height=28,
+                             corner_radius=self.radius,
+                             fg_color=self.accent["main"],
+                             hover_color=self.accent["hover"],
+                             command=quick_gift).pack(side="right")
+
+        def load_list():
+            pw = pw_e.get()
+            if not pw:
+                status_lbl.configure(
+                    text="✗ " + self.t("gift_need_password"),
+                    text_color="#F87171")
+                return
+            backend = self.store.data["settings"].get(
+                "backend_url", "").strip()
+            if not backend:
+                status_lbl.configure(
+                    text="✗ " + self.t("gift_no_backend"),
+                    text_color="#F87171")
+                return
+            status_lbl.configure(text="🔄 " + self.t("cloud_working"),
+                                 text_color=self.muted())
+
+            def worker():
+                try:
+                    body = json.dumps({"owner_password": pw}).encode()
+                    req = urllib.request.Request(
+                        f"{backend.rstrip('/')}/api/admin-list-accounts",
+                        data=body, method="POST",
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        result = json.loads(r.read().decode())
+                except urllib.error.HTTPError as he:
+                    if he.code == 401:
+                        self.after(0, lambda: status_lbl.configure(
+                            text="✗ " + self.t("gift_wrong_password"),
+                            text_color="#F87171"))
+                    else:
+                        self.after(0, lambda: status_lbl.configure(
+                            text="✗ " + self.t("gift_failed"),
+                            text_color="#F87171"))
+                    return
+                except Exception:
+                    self.after(0, lambda: status_lbl.configure(
+                        text="✗ " + self.t("gift_failed"),
+                        text_color="#F87171"))
+                    return
+                if result.get("ok"):
+                    self.after(0, lambda: (
+                        render_list(result["accounts"]),
+                        status_lbl.configure(text="")))
+                else:
+                    self.after(0, lambda: status_lbl.configure(
+                        text="✗ " + self.t("gift_failed"),
+                        text_color="#F87171"))
+            threading.Thread(target=worker, daemon=True).start()
+
+        self.btn(pw_row, text=self.t("gift_show_list"), width=140,
+                 height=36, command=load_list).pack(side="left")
+
+        if gift_pw_e.get():
+            load_list()
+
     def show_feature_tour(self):
         """❓ App-Tour: Schritt-für-Schritt-Erklärung aller Funktionen —
         blättert wie eine kleine Präsentation durch, mit Icon + kurzer
@@ -7145,6 +7303,137 @@ class App(ctk.CTk):
         url_row(self.t("backend_url_label"), "backend_url")
         url_row(self.t("checkout_url_label"), "checkout_url")
         ctk.CTkLabel(card, text="").pack(pady=(0, 8))
+
+        # --- 🎁 Premium an eine beliebige E-Mail verschenken ---
+        gift_box = ctk.CTkFrame(card, corner_radius=self.radius,
+                                border_width=1,
+                                border_color=self.accent["main"],
+                                **self.card_kw(2))
+        gift_box.pack(fill="x", padx=24, pady=(0, 20))
+        ctk.CTkLabel(gift_box, text="🎁 " + self.t("gift_title"),
+                     font=self.font(size=15, weight="bold")).pack(
+                         anchor="w", padx=16, pady=(14, 4))
+        ctk.CTkLabel(gift_box, text=self.t("gift_hint"),
+                     text_color=self.muted(), font=self.font(size=11),
+                     wraplength=560, justify="left").pack(anchor="w",
+                                                          padx=16,
+                                                          pady=(0, 10))
+
+        gift_row1 = ctk.CTkFrame(gift_box, fg_color="transparent")
+        gift_row1.pack(fill="x", padx=16, pady=(0, 8))
+        gift_email_e = ctk.CTkEntry(
+            gift_row1, placeholder_text=self.t("gift_email_ph"),
+            height=36, corner_radius=self.radius)
+        gift_email_e.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        gift_days_labels = {"7": "7 " + self.t("days_label"),
+                           "30": "30 " + self.t("days_label"),
+                           "90": "90 " + self.t("days_label"),
+                           "365": "365 " + self.t("days_label"),
+                           "forever": self.t("forever_label")}
+        gift_days_var = ctk.StringVar(value=gift_days_labels["30"])
+        ctk.CTkOptionMenu(gift_row1, values=list(gift_days_labels.values()),
+                          variable=gift_days_var, width=140, height=36,
+                          corner_radius=self.radius,
+                          fg_color=self.accent["main"],
+                          button_color=self.accent["hover"],
+                          text_color=self._opt_text_color()).pack(
+                              side="left")
+
+        gift_row2 = ctk.CTkFrame(gift_box, fg_color="transparent")
+        gift_row2.pack(fill="x", padx=16, pady=(0, 10))
+        gift_pw_e = ctk.CTkEntry(
+            gift_row2, placeholder_text=self.t("gift_owner_pw_ph"),
+            show="•", height=36, corner_radius=self.radius)
+        gift_pw_e.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        gift_status = ctk.CTkLabel(gift_box, text="", font=self.font(size=11),
+                                   wraplength=520, justify="left")
+        gift_status.pack(anchor="w", padx=16, pady=(0, 14))
+
+        def do_gift():
+            email = gift_email_e.get().strip().lower()
+            owner_pw = gift_pw_e.get()
+            if not email or "@" not in email:
+                gift_status.configure(text="✗ " + self.t("gift_bad_email"),
+                                      text_color="#F87171")
+                return
+            if not owner_pw:
+                gift_status.configure(
+                    text="✗ " + self.t("gift_need_password"),
+                    text_color="#F87171")
+                return
+            rev = {v: k for k, v in gift_days_labels.items()}
+            key = rev.get(gift_days_var.get(), "30")
+            days = None if key == "forever" else int(key)
+            backend = self.store.data["settings"].get(
+                "backend_url", "").strip()
+            if not backend:
+                gift_status.configure(
+                    text="✗ " + self.t("gift_no_backend"),
+                    text_color="#F87171")
+                return
+
+            gift_status.configure(text="🔄 " + self.t("gift_sending"),
+                                  text_color=self.muted())
+
+            def worker():
+                try:
+                    body = json.dumps({
+                        "email": email, "days": days,
+                        "owner_password": owner_pw,
+                    }).encode()
+                    req = urllib.request.Request(
+                        f"{backend.rstrip('/')}/api/admin-grant-premium",
+                        data=body, method="POST",
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        result = json.loads(r.read().decode())
+                except urllib.error.HTTPError as he:
+                    try:
+                        result = json.loads(he.read().decode())
+                    except Exception:
+                        result = {}
+                    if he.code == 401:
+                        self.after(0, lambda: gift_status.configure(
+                            text="✗ " + self.t("gift_wrong_password"),
+                            text_color="#F87171"))
+                        return
+                    self.after(0, lambda: gift_status.configure(
+                        text="✗ " + self.t("gift_failed"),
+                        text_color="#F87171"))
+                    return
+                except Exception:
+                    self.after(0, lambda: gift_status.configure(
+                        text="✗ " + self.t("gift_failed"),
+                        text_color="#F87171"))
+                    return
+
+                if result.get("ok"):
+                    msg = "✓ " + self.t("gift_ok")
+                    if not result.get("email_sent"):
+                        msg += "  (" + self.t("gift_ok_no_email") + ")"
+                    self.after(0, lambda: (
+                        gift_status.configure(text=msg,
+                                             text_color="#34D399"),
+                        gift_email_e.delete(0, "end"),
+                        gift_pw_e.delete(0, "end")))
+                else:
+                    self.after(0, lambda: gift_status.configure(
+                        text="✗ " + self.t("gift_failed"),
+                        text_color="#F87171"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        self.btn(gift_row2, text="🎁 " + self.t("gift_send"), width=160,
+                 height=36, command=do_gift).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(gift_row2, text="🌍 " + self.t("gift_browse_all"),
+                     width=220, height=36, corner_radius=self.radius,
+                     fg_color="transparent", border_width=1,
+                     border_color=self.accent["main"],
+                     text_color=self.accent["main"],
+                     hover_color=self.accent["hover"],
+                     command=lambda: self.show_worldwide_users_dialog(
+                         gift_email_e, gift_pw_e)).pack(side="left")
 
         # Nutzerliste
         ctk.CTkLabel(outer, text=self.t("registered_users"),
