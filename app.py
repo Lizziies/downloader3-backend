@@ -44,12 +44,20 @@ OWNER_EMAILS = {"felixwerther1@gmail.com", "lisa.werther@proton.me"}
 # 📧 E-Mail-Versand: genau dasselbe Prinzip — die App fragt diesen Server,
 # der Server verschickt die E-Mail mit SEINEN eigenen (nur hier
 # hinterlegten) SMTP-Zugangsdaten. Kein Passwort im verteilten Code.
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587").strip())
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER).strip()
 _email_attempts = {}  # einfacher Schutz gegen Missbrauch/Spam
+
+# 🎨 KI-Studio: EIN gemeinsamer Gemini-API-Schlüssel für ALLE Nutzer der
+# App — steht NUR hier als Umgebungsvariable, nie im verteilten Code.
+# WICHTIG: Da alle Nutzer denselben Schlüssel teilen, trägst DU (der
+# Owner) die Kosten dafür — die Rate-Begrenzung unten schützt vor Missbrauch,
+# ersetzt aber keine Kostenkontrolle bei sehr vielen Nutzern.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+_ai_attempts = {}  # Missbrauchsschutz: begrenzt Anfragen pro E-Mail
 
 # Verfügbare Pakete: Preis in EUR + wie viele Tage Premium es gibt
 # ("forever" = unbegrenzt). Passe Preise/Namen hier nach Belieben an.
@@ -551,6 +559,181 @@ def admin_list_accounts():
     accounts = [{"email": r[0], "premium_until": r[1],
                 "first_seen": r[2], "last_seen": r[3]} for r in rows]
     return jsonify({"ok": True, "accounts": accounts})
+
+
+def _check_ai_rate_limit(identifier, max_per_hour):
+    """Einfacher Missbrauchsschutz: begrenzt Anfragen pro E-Mail/Stunde."""
+    now = datetime.datetime.now()
+    attempts = [t for t in _ai_attempts.get(identifier, [])
+               if (now - t).total_seconds() < 3600]
+    if len(attempts) >= max_per_hour:
+        return False
+    attempts.append(now)
+    _ai_attempts[identifier] = attempts
+    return True
+
+
+@app.route("/api/ai-text", methods=["POST", "OPTIONS"])
+def ai_text():
+    """🎨 KI-Studio: Text-Generierung über den GEMEINSAMEN Gemini-Schlüssel
+    dieses Servers — die App selbst braucht keinen eigenen Schlüssel."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "not configured"}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    identifier = (data.get("email") or request.remote_addr or "anon")
+    if not prompt:
+        return jsonify({"ok": False, "error": "no prompt"}), 400
+    if not _check_ai_rate_limit("text:" + identifier, 30):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    try:
+        url = ("https://generativelanguage.googleapis.com/v1beta/"
+              f"models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}")
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}]
+        }).encode()
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result = json.loads(r.read().decode())
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+        return jsonify({"ok": True, "text": text})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ai-image", methods=["POST", "OPTIONS"])
+def ai_image():
+    """🎨 KI-Studio: Bild-Generierung über den gemeinsamen Schlüssel."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "not configured"}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    identifier = (data.get("email") or request.remote_addr or "anon")
+    if not prompt:
+        return jsonify({"ok": False, "error": "no prompt"}), 400
+    if not _check_ai_rate_limit("image:" + identifier, 15):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    try:
+        url = ("https://generativelanguage.googleapis.com/v1beta/"
+              f"models/gemini-2.0-flash-exp:generateContent?"
+              f"key={GEMINI_API_KEY}")
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+        }).encode()
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            result = json.loads(r.read().decode())
+        parts = result["candidates"][0]["content"]["parts"]
+        img_b64 = next((p["inlineData"]["data"] for p in parts
+                        if "inlineData" in p), None)
+        if not img_b64:
+            return jsonify({"ok": False, "error": "no image returned"}), 502
+        return jsonify({"ok": True, "image_base64": img_b64})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ai-video", methods=["POST", "OPTIONS"])
+def ai_video():
+    """🎨 KI-Studio: Video-Generierung (experimentell, Veo) über den
+    gemeinsamen Schlüssel — startet nur den Auftrag, die App fragt den
+    Fortschritt separat über /api/ai-video-status ab (dauert Minuten)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "not configured"}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    identifier = (data.get("email") or request.remote_addr or "anon")
+    if not prompt:
+        return jsonify({"ok": False, "error": "no prompt"}), 400
+    if not _check_ai_rate_limit("video:" + identifier, 5):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    try:
+        url = ("https://generativelanguage.googleapis.com/v1beta/"
+              f"models/veo-2.0-generate-001:predictLongRunning"
+              f"?key={GEMINI_API_KEY}")
+        body = json.dumps({"instances": [{"prompt": prompt}]}).encode()
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            op = json.loads(r.read().decode())
+        if not op.get("name"):
+            return jsonify({"ok": False, "error": str(op)}), 502
+        return jsonify({"ok": True, "operation": op["name"]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ai-video-status", methods=["GET"])
+def ai_video_status():
+    """🎨 Fragt den Fortschritt einer laufenden Video-Generierung ab.
+    Gibt NIE den geteilten API-Schlüssel an die App weiter — das
+    eigentliche Herunterladen läuft über /api/ai-video-download."""
+    if not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "not configured"}), 503
+    op_name = request.args.get("operation") or ""
+    if not op_name:
+        return jsonify({"ok": False, "error": "no operation"}), 400
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/"
+              f"{op_name}?key={GEMINI_API_KEY}")
+        with urllib.request.urlopen(url, timeout=30) as r:
+            result = json.loads(r.read().decode())
+        if not result.get("done"):
+            return jsonify({"ok": True, "done": False})
+        samples = (result.get("response", {})
+                  .get("generateVideoResponse", {})
+                  .get("generatedSamples", []))
+        if not samples:
+            return jsonify({"ok": False, "done": True,
+                            "error": str(result.get("error", result))})
+        return jsonify({"ok": True, "done": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ai-video-download", methods=["GET"])
+def ai_video_download():
+    """🎨 Lädt das fertige Video vom Server herunter und reicht die Datei
+    direkt an die App weiter — der geteilte API-Schlüssel bleibt dabei
+    ausschließlich auf dem Server, die App sieht ihn nie."""
+    if not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "not configured"}), 503
+    op_name = request.args.get("operation") or ""
+    if not op_name:
+        return jsonify({"ok": False, "error": "no operation"}), 400
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/"
+              f"{op_name}?key={GEMINI_API_KEY}")
+        with urllib.request.urlopen(url, timeout=30) as r:
+            result = json.loads(r.read().decode())
+        samples = (result.get("response", {})
+                  .get("generateVideoResponse", {})
+                  .get("generatedSamples", []))
+        if not samples:
+            return jsonify({"ok": False, "error": "not ready"}), 404
+        video_uri = samples[0]["video"]["uri"]
+        dl_url = video_uri if "key=" in video_uri else (
+            video_uri + ("&" if "?" in video_uri else "?")
+            + f"key={GEMINI_API_KEY}")
+        video_req = urllib.request.Request(dl_url)
+        with urllib.request.urlopen(video_req, timeout=120) as vr:
+            video_bytes = vr.read()
+        from flask import Response
+        return Response(video_bytes, mimetype="video/mp4")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/", methods=["GET"])
