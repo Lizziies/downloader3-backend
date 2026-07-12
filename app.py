@@ -586,7 +586,7 @@ def ai_text():
     identifier = (data.get("email") or request.remote_addr or "anon")
     if not prompt:
         return jsonify({"ok": False, "error": "no prompt"}), 400
-    if not _check_ai_rate_limit("text:" + identifier, 30):
+    if not _check_ai_rate_limit("text:" + identifier, 60):
         return jsonify({"ok": False, "error": "rate limited"}), 429
     try:
         url = ("https://generativelanguage.googleapis.com/v1beta/"
@@ -617,7 +617,7 @@ def ai_image():
     identifier = (data.get("email") or request.remote_addr or "anon")
     if not prompt:
         return jsonify({"ok": False, "error": "no prompt"}), 400
-    if not _check_ai_rate_limit("image:" + identifier, 15):
+    if not _check_ai_rate_limit("image:" + identifier, 30):
         return jsonify({"ok": False, "error": "rate limited"}), 429
     try:
         url = ("https://generativelanguage.googleapis.com/v1beta/"
@@ -656,7 +656,7 @@ def ai_video():
     identifier = (data.get("email") or request.remote_addr or "anon")
     if not prompt:
         return jsonify({"ok": False, "error": "no prompt"}), 400
-    if not _check_ai_rate_limit("video:" + identifier, 5):
+    if not _check_ai_rate_limit("video:" + identifier, 10):
         return jsonify({"ok": False, "error": "rate limited"}), 429
     try:
         url = ("https://generativelanguage.googleapis.com/v1beta/"
