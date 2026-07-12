@@ -590,7 +590,7 @@ def ai_text():
         return jsonify({"ok": False, "error": "rate limited"}), 429
     try:
         url = ("https://generativelanguage.googleapis.com/v1beta/"
-              f"models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}")
+              f"models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}")
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}]
         }).encode()
@@ -621,7 +621,7 @@ def ai_image():
         return jsonify({"ok": False, "error": "rate limited"}), 429
     try:
         url = ("https://generativelanguage.googleapis.com/v1beta/"
-              f"models/gemini-2.0-flash-exp:generateContent?"
+              f"models/gemini-2.5-flash-image:generateContent?"
               f"key={GEMINI_API_KEY}")
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
@@ -660,7 +660,7 @@ def ai_video():
         return jsonify({"ok": False, "error": "rate limited"}), 429
     try:
         url = ("https://generativelanguage.googleapis.com/v1beta/"
-              f"models/veo-2.0-generate-001:predictLongRunning"
+              f"models/veo-3.1-generate-preview:predictLongRunning"
               f"?key={GEMINI_API_KEY}")
         body = json.dumps({"instances": [{"prompt": prompt}]}).encode()
         req = urllib.request.Request(
