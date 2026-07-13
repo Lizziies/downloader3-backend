@@ -17,7 +17,6 @@ WICHTIG — das musst du selbst einrichten:
 
 import os
 import json
-import socket
 import sqlite3
 import secrets
 import datetime
@@ -363,34 +362,6 @@ def verify_owner():
     return jsonify({"ok": False}), 401
 
 
-# 🐛 FIX ("Net unreachable" bei E-Mail-Versand): Hoster wie Render haben
-# nach außen oft KEIN funktionierendes IPv6, aber smtp.gmail.com (und
-# viele andere SMTP-Server) haben sowohl eine IPv4- als auch eine
-# IPv6-Adresse. Pythons Standard-smtplib probiert je nach Auflösung
-# manchmal zuerst IPv6 -> die ist von dort aus nicht erreichbar ->
-# genau die Meldung "Network is unreachable". Diese zwei Klassen
-# zwingen die Verbindung gezielt auf IPv4, der Zertifikats-Check beim
-# TLS-Handshake bleibt dabei unverändert korrekt (server_hostname wird
-# weiterhin auf den echten Hostnamen gesetzt, nur die IP-Adresse für
-# die eigentliche Socket-Verbindung wird auf IPv4 festgelegt).
-def _ipv4_connect(host, port, timeout):
-    infos = socket.getaddrinfo(host, port, socket.AF_INET,
-                               socket.SOCK_STREAM)
-    ip = infos[0][4][0]
-    return socket.create_connection((ip, port), timeout=timeout)
-
-
-class _IPv4SMTP(smtplib.SMTP):
-    def _get_socket(self, host, port, timeout):
-        return _ipv4_connect(host, port, timeout)
-
-
-class _IPv4SMTP_SSL(smtplib.SMTP_SSL):
-    def _get_socket(self, host, port, timeout):
-        sock = _ipv4_connect(host, port, timeout)
-        return self.context.wrap_socket(sock, server_hostname=self._host)
-
-
 def _smtp_send(to_addr, subject, body):
     """Verschickt eine einzelne E-Mail über die Server-eigenen SMTP-
     Zugangsdaten. Wirft eine Exception bei Fehlern (vom Aufrufer abfangen)."""
@@ -399,9 +370,9 @@ def _smtp_send(to_addr, subject, body):
     msg["From"] = SMTP_FROM
     msg["To"] = to_addr
     if SMTP_PORT == 465:
-        server = _IPv4SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
     else:
-        server = _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
         server.starttls()
     server.login(SMTP_USER, SMTP_PASSWORD)
     server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
