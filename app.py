@@ -16,7 +16,9 @@ WICHTIG — das musst du selbst einrichten:
 """
 
 import os
+import re
 import json
+import base64
 import socket
 import sqlite3
 import secrets
@@ -71,6 +73,19 @@ _email_attempts = {}  # einfacher Schutz gegen Missbrauch/Spam
 # ersetzt aber keine Kostenkontrolle bei sehr vielen Nutzern.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 _ai_attempts = {}  # Missbrauchsschutz: begrenzt Anfragen pro E-Mail
+
+# 🎧 Musik-Download (Spotify/Apple Music/Amazon Music): Spotify streamt
+# DRM-verschlüsselt — wir laden dort NICHTS direkt herunter, sondern
+# lesen nur die ÖFFENTLICHEN Metadaten (Songtitel + Künstler) über
+# Spotifys offizielle Web-API aus (Client-Credentials-Flow, braucht
+# KEIN Nutzer-Login, nur eine kostenlose App-Registrierung). Die App
+# sucht den Song danach selbst ganz normal auf YouTube. Kostenlose
+# Einrichtung: https://developer.spotify.com/dashboard -> "Create app"
+# -> Client ID + Client Secret hier als Umgebungsvariablen eintragen.
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+_spotify_token_cache = {"token": None, "expires": None}
+_music_attempts = {}  # Missbrauchsschutz: begrenzt Anfragen pro IP/Stunde
 
 # Verfügbare Pakete: Preis in EUR + wie viele Tage Premium es gibt
 # ("forever" = unbegrenzt). Passe Preise/Namen hier nach Belieben an.
@@ -845,6 +860,190 @@ def ai_video_download():
             video_bytes = vr.read()
         from flask import Response
         return Response(video_bytes, mimetype="video/mp4")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# 🎧 Musik-Download (Spotify/Apple Music/Amazon Music)
+# ---------------------------------------------------------------------------
+# WICHTIG: Wir laden hier NIEMALS Audio direkt von diesen Diensten
+# herunter — das würde bedeuten, ihren Kopierschutz (DRM) zu umgehen,
+# was in den meisten Ländern verboten ist (z. B. DMCA in den USA). Wir
+# lesen ausschließlich ÖFFENTLICHE, unverschlüsselte Metadaten
+# (Songtitel + Künstler) aus. Die App sucht den Song danach selbst ganz
+# normal auf YouTube und lädt IHN — genau wie bei jedem anderen
+# YouTube-Download in der App.
+def _spotify_access_token():
+    """Holt (und cached) einen App-Zugangs-Token über Spotifys
+    Client-Credentials-Flow — braucht KEIN Nutzer-Login, nur die eigene
+    App-Registrierung. Wirft eine Exception, wenn nicht konfiguriert
+    oder Spotify ablehnt."""
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        raise RuntimeError("spotify not configured")
+    now = datetime.datetime.now()
+    cached = _spotify_token_cache
+    if cached["token"] and cached["expires"] and now < cached["expires"]:
+        return cached["token"]
+    auth = base64.b64encode(
+        f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    body = b"grant_type=client_credentials"
+    req = urllib.request.Request(
+        "https://accounts.spotify.com/api/token", data=body, method="POST",
+        headers={"Authorization": f"Basic {auth}",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        result = json.loads(r.read().decode())
+    token = result["access_token"]
+    expires_in = int(result.get("expires_in", 3600))
+    # Etwas früher als offiziell nötig ablaufen lassen (Sicherheitsnetz
+    # gegen knapp abgelaufene Tokens bei einer laufenden Anfrage).
+    cached["token"] = token
+    cached["expires"] = now + datetime.timedelta(seconds=expires_in - 60)
+    return token
+
+
+def _spotify_get(path):
+    token = _spotify_access_token()
+    req = urllib.request.Request(
+        f"https://api.spotify.com/v1{path}",
+        headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def _spotify_track_to_item(t):
+    if not t:
+        return None
+    artists = ", ".join(a.get("name", "") for a in (t.get("artists") or [])
+                        if a.get("name"))
+    title = t.get("name") or ""
+    if not title:
+        return None
+    return {"title": title, "artist": artists}
+
+
+_SPOTIFY_ID_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-\w+/)?(track|playlist|album)/([A-Za-z0-9]+)")
+
+
+def _resolve_spotify(url):
+    m = _SPOTIFY_ID_RE.search(url)
+    if not m:
+        raise RuntimeError("invalid spotify url")
+    kind, sid = m.group(1), m.group(2)
+    if kind == "track":
+        t = _spotify_get(f"/tracks/{sid}")
+        item = _spotify_track_to_item(t)
+        if not item:
+            raise RuntimeError("track not found")
+        return [item]
+    if kind == "album":
+        data = _spotify_get(f"/albums/{sid}/tracks?limit=50")
+        items = [_spotify_track_to_item(t) for t in data.get("items", [])]
+        return [i for i in items if i]
+    # playlist — auf 200 Songs gedeckelt (großzügig, verhindert aber eine
+    # riesige Anfrage bei Mega-Playlists mit tausenden Songs)
+    items = []
+    offset = 0
+    while offset < 200:
+        data = _spotify_get(
+            f"/playlists/{sid}/tracks?limit=50&offset={offset}"
+            "&fields=items(track(name,artists(name))),next")
+        for entry in data.get("items", []):
+            item = _spotify_track_to_item(entry.get("track"))
+            if item:
+                items.append(item)
+        if not data.get("next"):
+            break
+        offset += 50
+    return items
+
+
+def _scrape_page_title_artist(url):
+    """🌐 Bestes-Bemühen-Auslesen von Songtitel + Künstler aus der
+    ÖFFENTLICH sichtbaren Seite (og:title/og:description-Metatags —
+    dieselben Infos, die z. B. auch beim Teilen des Links in Whatsapp/
+    Discord als Vorschau angezeigt werden). Genutzt für Apple Music und
+    Amazon Music, die (anders als Spotify) keine kostenlose öffentliche
+    API für Song-Metadaten anbieten."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        html = r.read(200_000).decode("utf-8", errors="ignore")
+    def meta(prop):
+        # 🐛 Robuster: HTML-Meta-Tags schreiben "property"/"name" und
+        # "content" nicht immer in derselben Reihenfolge — beide
+        # Varianten durchprobieren, statt nur eine anzunehmen.
+        m = re.search(
+            rf'<meta[^>]+(?:property|name)=["\']{re.escape(prop)}["\']'
+            r'[^>]+content=["\']([^"\']*)["\']', html, re.IGNORECASE)
+        if not m:
+            m = re.search(
+                r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+'
+                rf'(?:property|name)=["\']{re.escape(prop)}["\']',
+                html, re.IGNORECASE)
+        return m.group(1).strip() if m else None
+    title = meta("og:title")
+    desc = meta("og:description") or ""
+    if not title:
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+        title = m.group(1).strip() if m else None
+    if not title:
+        raise RuntimeError("title not found")
+    # og:title ist meist NUR der Songtitel, der Künstler steckt oft im
+    # og:description ("Song · Künstler · ...", "Künstler · Song") oder im
+    # <title> ("Songtitel - song by Künstler | ..."). Mehrere gängige
+    # Muster durchprobieren, sonst bleibt der Künstler leer (immer noch
+    # besser als komplett zu scheitern — die YouTube-Suche findet den
+    # Song meist auch nur mit dem Titel).
+    artist = None
+    m = re.search(r"song by ([^|·]+)", title + " " + desc, re.IGNORECASE)
+    if m:
+        artist = m.group(1).strip()
+    if not artist and "·" in desc:
+        parts = [p.strip() for p in desc.split("·") if p.strip()]
+        if len(parts) >= 2:
+            artist = parts[1] if parts[0].lower() == title.lower() \
+                else parts[0]
+    # <title>-Tag enthält oft " - song by X | ..." -> das Suffix abtrennen
+    title = re.split(r"\s*[-–]\s*song by\s", title, flags=re.IGNORECASE)[0]
+    title = title.split("|")[0].strip()
+    return {"title": title, "artist": artist or ""}
+
+
+@app.route("/api/music-lookup", methods=["POST", "OPTIONS"])
+def music_lookup():
+    """🎧 Liest Songtitel + Künstler aus einem Spotify-/Apple-Music-/
+    Amazon-Music-Link aus (nur öffentliche Metadaten, kein DRM-Umgehen)
+    — die App sucht den Song danach selbst auf YouTube."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "no url"}), 400
+
+    # Missbrauchsschutz: max. 30 Anfragen pro IP und Stunde
+    identifier = request.remote_addr or "anon"
+    now = datetime.datetime.now()
+    attempts = [t for t in _music_attempts.get(identifier, [])
+               if (now - t).total_seconds() < 3600]
+    if len(attempts) >= 30:
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    attempts.append(now)
+    _music_attempts[identifier] = attempts
+
+    try:
+        if "open.spotify.com" in url:
+            items = _resolve_spotify(url)
+        elif "music.apple.com" in url or "music.amazon." in url:
+            items = [_scrape_page_title_artist(url)]
+        else:
+            return jsonify({"ok": False, "error": "unsupported url"}), 400
+        if not items:
+            return jsonify({"ok": False, "error": "no tracks found"}), 404
+        return jsonify({"ok": True, "items": items})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
