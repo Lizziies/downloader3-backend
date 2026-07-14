@@ -144,3 +144,237 @@ neu, wenn du bei GitHub etwas änderst).
 - Die Checkout-Seite braucht nur die Client **ID** (öffentlich, das ist
   normal und sicher), niemals das Secret.
 - `PAYPAL_MODE=live` erst umstellen, wenn Sandbox-Tests erfolgreich waren.
+
+## 🔒 Update — Owner-Login jetzt sicher (kein Passwort mehr im Programmcode!)
+
+**Wichtig, falls ihr die App öffentlich verteilen wollt:** Bisher stand das
+Owner-Passwort fest im main.py-Code — das hätte bedeutet, dass jeder, der
+die App-Datei bekommt, sich selbst als "Felix" oder "Lisa" hätte einloggen
+und sich kostenlos Premium für immer freischalten können. Das ist jetzt
+behoben: das echte Passwort lebt nur noch **hier auf dem Server**, als
+Umgebungsvariable.
+
+### Das musst du einmalig auf Render nachtragen
+
+1. Gehe zu deinem Render-Dashboard → dein Backend-Service (z. B.
+   `downloader3-backend`)
+2. Links auf **"Environment"** klicken
+3. **"+ Add Environment Variable"**:
+   - Name: `OWNER_PASSWORD`
+   - Value: ein **neues, sicheres Passwort** deiner Wahl (kann, muss aber
+     nicht das alte sein — neu ist sogar sicherer, da das alte jetzt in
+     diesem Chat-Verlauf steht)
+4. Speichern — Render startet den Server automatisch neu
+
+### Was sich für dich als Owner ändert
+
+- Beim **nächsten Login** auf jedem deiner Geräte (PC, Laptop, ...) wirst
+  du einmalig gefragt und die App prüft das Passwort **einmalig online**
+  gegen den Server
+- Danach merkt sich **dieses eine Gerät** den Zugang — du musst dich nicht
+  bei jedem Login neu online verifizieren, nur einmalig pro Gerät
+- Ohne Internetverbindung geht die allererste Anmeldung auf einem neuen
+  Gerät nicht — das ist beabsichtigt (Sicherheit vor Bequemlichkeit)
+
+### Für alle anderen (öffentliche Downloads der App)
+
+Ohne das echte Passwort zu kennen, kann niemand mehr Owner-Zugriff auf
+seiner eigenen Kopie der App bekommen — das Premium-/Bezahlsystem bleibt
+dadurch für alle Nutzer fair und funktionsfähig.
+
+## 📧 Update — E-Mail-Versand jetzt auch über den Server (kein Passwort in der App)
+
+Genau wie beim Owner-Login: Die App kennt kein E-Mail-Passwort mehr selbst
+— sie fragt diesen Server, und der Server verschickt die E-Mail mit
+**seinen eigenen** (nur hier hinterlegten) Zugangsdaten.
+
+### Das musst du einmalig auf Render eintragen
+
+Bei **Environment**, zusätzlich zu `OWNER_PASSWORD`:
+
+| Name | Wert |
+|---|---|
+| `SMTP_HOST` | `smtp.gmail.com` |
+| `SMTP_PORT` | `587` |
+| `SMTP_USER` | `lisawer008@gmail.com` |
+| `SMTP_PASSWORD` | dein **App-Passwort** (das neue, nachdem du das alte gelöscht hast!) |
+| `SMTP_FROM` | `lisawer008@gmail.com` |
+
+Danach funktioniert der E-Mail-Versand auf **jedem** Gerät automatisch,
+ganz ohne dass irgendwer (auch nicht dein eigenes Gerät) das Passwort
+lokal eintragen muss — die App fragt einfach den Server. Nur falls der
+Server mal nicht erreichbar ist, fällt die App auf ein lokal eingetragenes
+SMTP zurück (falls vorhanden) oder zeigt den Code direkt in der App an.
+
+### Schutz gegen Missbrauch
+- Max. 5 E-Mails pro Adresse pro Stunde (verhindert Spam-Missbrauch)
+- E-Mail-Adressen werden grob validiert, bevor überhaupt versucht wird zu senden
+
+## 🌍 Update — Premium-Status ist jetzt an dein Konto gebunden, nicht ans Gerät
+
+**Genau das Problem gelöst:** Kauft jemand z. B. Lifetime-Premium, wechselt
+danach den PC oder installiert die App neu, war das Premium bisher weg
+(weil es nur lokal auf dem alten Gerät gespeichert war). Jetzt merkt sich
+der **Server** zusätzlich, welche E-Mail-Adresse Premium hat — komplett
+unabhängig vom Gerät.
+
+### Was neu ist
+- Die Checkout-Webseite fragt jetzt zusätzlich nach der E-Mail-Adresse
+  (derselben wie in der App) — der Kauf wird direkt daran gebunden
+- Bei jedem Login/jeder Registrierung fragt die App automatisch den
+  Server: "Hat diese E-Mail schon Premium?" — falls ja, wird es
+  automatisch übernommen, auch auf einem brandneuen, leeren Gerät
+- Auch Admin-vergebene Geschenk-Codes werden jetzt zusätzlich am Konto
+  festgemacht (nicht nur lokal)
+- **Nie verkürzen:** Hat jemand z. B. schon Lifetime, und kauft aus
+  Versehen nochmal 30 Tage, bleibt Lifetime bestehen — es wird immer der
+  großzügigere Stand übernommen
+
+Keine neuen Umgebungsvariablen nötig — das läuft direkt über eine neue
+Tabelle in der bestehenden Datenbank. Mit mehreren Tests abgesichert,
+inklusive dem genauen Szenario "Lifetime kaufen → PC wechseln →
+App neu installieren → Premium ist automatisch wieder da".
+
+## ☁️ Update — Komplette Cloud-Sicherung (Einstellungen, Verlauf, Favoriten, Abos)
+
+Zusätzlich zum Premium-Status kann jetzt der **komplette lokale Zustand**
+an ein Konto gebunden gesichert werden — Design, Farben, Schriftart,
+Download-Verlauf, Favoriten und Kanal-Abos. Läuft über zwei neue
+Endpunkte (`/api/backup-settings`, `/api/restore-settings`), keine neuen
+Umgebungsvariablen nötig. Das E-Mail-Passwort/SMTP wird dabei **nie**
+mitgesichert — bleibt immer lokal pro Gerät.
+
+Mit vollständigem Test abgesichert: Sicherung auf "PC 1" → komplett
+identisch auf "PC 2" wiederhergestellt (Design, Verlauf, Favoriten, Abos),
+inklusive Schutz gegen zu große/missbräuchliche Sicherungen (3-MB-Grenze).
+
+## 🎁 Update — Premium an eine beliebige E-Mail verschenken
+
+Neuer Endpunkt `/api/admin-grant-premium` — geschützt durch dasselbe
+`OWNER_PASSWORD` wie der Owner-Login. Funktioniert auch für Personen, die
+die App noch nie genutzt haben: sobald sie sich mit der beschenkten
+E-Mail-Adresse registrieren/anmelden, ist ihr Premium automatisch da
+(über den bestehenden Konto-Sync-Mechanismus). Verschickt zusätzlich eine
+zweisprachige (DE + EN) Glückwunsch-Mail über die server-eigenen
+SMTP-Zugangsdaten.
+
+Mit einem echten End-zu-End-Test bestätigt: Owner verschenkt 90 Tage an
+eine wildfremde Person → diese Person hätte, würde sie die App
+installieren, ihr Premium sofort automatisch aktiv.
+
+## 🌍 Update — Liste aller weltweiten Nutzer für den Owner
+
+Neuer Endpunkt `/api/admin-list-accounts` (geschützt durch OWNER_PASSWORD)
+— zeigt jede E-Mail-Adresse, die jemals mit der App interagiert hat
+(Login, Registrierung, Kauf), nicht nur lokal bekannte. Jede App-Instanz
+"meldet sich" automatisch beim Server (über den schon bestehenden
+Premium-Sync-Check), wodurch sich diese Liste von selbst füllt.
+
+Mit Test abgesichert: 3 simulierte Nutzer weltweit → Owner sieht alle 3,
+ohne sie vorher gekannt zu haben; falsches Passwort → Liste bleibt geschützt.
+
+## ⏰ Server dauerhaft "wach" halten (kein Einschlafen mehr)
+
+Der kostenlose Render-Tarif schläft nach 15 Minuten Inaktivität ein und
+braucht dann beim nächsten Aufruf bis zu 50 Sekunden zum Aufwachen. Zwei
+Möglichkeiten, das zu vermeiden:
+
+### Option 1 — Kostenlos: externer "Wach-Halte"-Dienst
+Ein kostenloser Dienst ruft alle 10 Minuten deinen Server auf, damit er nie
+lange genug inaktiv ist zum Einschlafen:
+1. Geh auf **https://cron-job.org** (oder alternativ uptimerobot.com)
+2. Kostenloses Konto erstellen
+3. Neuen "Cronjob"/Monitor anlegen:
+   - URL: `https://downloader3-backend.onrender.com`
+   - Intervall: alle 10 Minuten
+4. Speichern — läuft danach automatisch im Hintergrund, kostenlos
+
+### Option 2 — Bezahlt: Render-Tarif hochstufen
+Der "Starter"-Tarif (ca. 7 $/Monat) schläft nie ein. Auf Render:
+dein Service → "Settings" → "Instance Type" → "Starter" auswählen.
+
+**Empfehlung:** Fang mit Option 1 (kostenlos) an — reicht für die meisten
+Fälle völlig aus.
+
+## 🎨 Update — KI-Studio jetzt KOSTENLOS für alle Nutzer (kein eigener API-Schlüssel nötig)
+
+Neue Endpunkte: `/api/ai-text`, `/api/ai-image`, `/api/ai-video`,
+`/api/ai-video-status`, `/api/ai-video-download` — verwenden EINEN
+gemeinsamen Gemini-API-Schlüssel (als Umgebungsvariable), den ALLE Nutzer
+der App automatisch mitbenutzen. Niemand muss mehr selbst einen
+API-Schlüssel besorgen.
+
+### ⚠️ Wichtig, bevor du das aktivierst
+Da alle Nutzer denselben Schlüssel teilen, **trägst du die Kosten** dafür
+(auch wenn Gemini eine kostenlose Stufe hat — bei vielen Nutzern kann das
+gemeinsame Kontingent schneller aufgebraucht sein). Eingebauter Schutz:
+Rate-Begrenzung pro E-Mail (Text: 30/Std., Bilder: 15/Std., Video: 5/Std.)
+— das verhindert groben Missbrauch, ersetzt aber keine echte
+Kostenkontrolle bei sehr großem Nutzerkreis.
+
+### Einrichtung
+1. Eigenen (kostenlosen) API-Schlüssel holen: **https://aistudio.google.com/apikey**
+2. Render → dein Backend-Service → Environment → **`GEMINI_API_KEY`**
+   eintragen
+3. Speichern — läuft automatisch für alle Nutzer der App, ohne dass sie
+   selbst etwas einrichten müssen
+
+### Sicherheits-Hinweis
+Der geteilte Schlüssel wird **nie** an die App weitergegeben — auch nicht
+beim Video-Download (der Server lädt das fertige Video selbst herunter und
+reicht nur die Datei weiter, nicht die Zugangsdaten).
+
+## 📧 E-Mail-Versand reparieren: "Network unreachable" (Render Free)
+
+**Das Problem:** Render blockiert im kostenlosen Tarif ALLE ausgehenden
+SMTP-Verbindungen (Ports 25/465/587) — als Spam-Schutz, offiziell
+dokumentiert. Deshalb schlägt jeder direkte E-Mail-Versand über
+smtp.gmail.com von dort mit "Network unreachable" fehl, bei allen
+Nutzern weltweit. Kein Bug in der App — eine Hoster-Sperre.
+
+**Die Lösung (eingebaut):** Der Server verschickt E-Mails jetzt über die
+Brevo-HTTPS-API (Port 443, nie blockiert). Kostenlos bis 300 E-Mails
+pro Tag, keine eigene Domain nötig. Einrichtung dauert ~5 Minuten:
+
+### Schritt 1 — Brevo-Konto anlegen
+1. https://www.brevo.com öffnen → kostenlos registrieren
+   (am besten mit derselben Gmail-Adresse, von der die App-Mails
+   kommen sollen).
+2. Bestätigungs-Mail anklicken, Anmeldung abschließen.
+
+### Schritt 2 — Absender-Adresse verifizieren
+1. In Brevo: oben rechts aufs Profil → "Senders & Domains" →
+   Reiter "Senders".
+2. Deine Absender-Adresse (z. B. deine Gmail) als Sender hinzufügen —
+   Brevo schickt eine Bestätigungs-Mail an diese Adresse → Link klicken.
+
+### Schritt 3 — API-Schlüssel erzeugen
+1. In Brevo: Profil → "SMTP & API" → Reiter "API Keys" →
+   "Generate a new API key" → Namen vergeben (z. B. "downloader3") →
+   Schlüssel KOPIEREN (wird nur einmal angezeigt!).
+
+### Schritt 4 — Auf Render eintragen
+1. https://dashboard.render.com → deinen Service
+   (downloader3-backend) anklicken → links "Environment".
+2. Neue Umgebungsvariable: Key = BREVO_API_KEY, Value = der kopierte
+   Schlüssel → "Save Changes".
+3. Prüfen, dass SMTP_FROM (oder SMTP_USER) auf die in Schritt 2
+   verifizierte Absender-Adresse gesetzt ist.
+4. Die neue app.py ins Backend-Repo hochladen (falls noch nicht
+   geschehen) — Render deployt automatisch neu.
+
+### Schritt 5 — Testen
+In der App einen Verifizierungs-Code anfordern (Registrierung) —
+die Mail sollte innerhalb von Sekunden ankommen. Falls nicht, zeigt
+die App jetzt die ECHTE Fehlermeldung des Servers an (dank des
+verbesserten Fehler-Durchreichens in main.py).
+
+**Hinweise:**
+- Die alten SMTP-Umgebungsvariablen können bleiben — sie dienen als
+  Fallback auf Hostern ohne SMTP-Sperre und SMTP_FROM/SMTP_USER wird
+  weiterhin als Absender-Adresse verwendet.
+- Optional: BREVO_FROM_NAME setzen (Anzeigename, Standard
+  "Downloader<3").
+- Brevo Free hängt an jede Mail einen kleinen "Sent with Brevo"-Hinweis
+  an — bei einem Gratis-Dienst fair und für Verifizierungs-Codes
+  unproblematisch.
