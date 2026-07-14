@@ -17,6 +17,7 @@ WICHTIG — das musst du selbst einrichten:
 
 import os
 import json
+import socket
 import sqlite3
 import secrets
 import datetime
@@ -49,6 +50,18 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587").strip())
 SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER).strip()
+# 🐛 KERN-FIX ("Network unreachable" bei E-Mails): Render BLOCKIERT im
+# kostenlosen Tarif ALLE ausgehenden SMTP-Verbindungen (Ports 25/465/587,
+# als Spam-Schutz — offiziell dokumentiert). Direkter SMTP-Versand von
+# diesem Server kann dort also NIE funktionieren, egal ob IPv4 oder IPv6
+# — genau daher kam die Meldung. Lösung: Versand über eine HTTPS-E-Mail-
+# API (Port 443 ist nie blockiert). Brevo ist kostenlos (300 Mails/Tag)
+# und braucht keine eigene Domain — Einrichtung siehe README in diesem
+# Ordner. Ist BREVO_API_KEY gesetzt, läuft ALLER Versand darüber;
+# ansonsten wird wie bisher SMTP versucht (funktioniert auf Hostern,
+# die SMTP nicht blockieren).
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
+BREVO_FROM_NAME = os.environ.get("BREVO_FROM_NAME", "Downloader<3").strip()
 _email_attempts = {}  # einfacher Schutz gegen Missbrauch/Spam
 
 # 🎨 KI-Studio: EIN gemeinsamer Gemini-API-Schlüssel für ALLE Nutzer der
@@ -362,21 +375,108 @@ def verify_owner():
     return jsonify({"ok": False}), 401
 
 
-def _smtp_send(to_addr, subject, body):
-    """Verschickt eine einzelne E-Mail über die Server-eigenen SMTP-
-    Zugangsdaten. Wirft eine Exception bei Fehlern (vom Aufrufer abfangen)."""
+# 🐛 FIX ("Net unreachable" bei E-Mail-Versand): Hoster wie Render haben
+# nach außen oft KEIN funktionierendes IPv6, aber smtp.gmail.com (und
+# viele andere SMTP-Server) haben sowohl eine IPv4- als auch eine
+# IPv6-Adresse. Pythons Standard-smtplib probiert je nach Auflösung
+# manchmal zuerst IPv6 -> die ist von dort aus nicht erreichbar ->
+# genau die Meldung "Network is unreachable". Diese zwei Klassen
+# zwingen die Verbindung gezielt auf IPv4, der Zertifikats-Check beim
+# TLS-Handshake bleibt dabei unverändert korrekt (server_hostname wird
+# weiterhin auf den echten Hostnamen gesetzt, nur die IP-Adresse für
+# die eigentliche Socket-Verbindung wird auf IPv4 festgelegt).
+def _ipv4_connect(host, port, timeout):
+    infos = socket.getaddrinfo(host, port, socket.AF_INET,
+                               socket.SOCK_STREAM)
+    ip = infos[0][4][0]
+    return socket.create_connection((ip, port), timeout=timeout)
+
+
+class _IPv4SMTP(smtplib.SMTP):
+    def _get_socket(self, host, port, timeout):
+        return _ipv4_connect(host, port, timeout)
+
+
+class _IPv4SMTP_SSL(smtplib.SMTP_SSL):
+    def _get_socket(self, host, port, timeout):
+        sock = _ipv4_connect(host, port, timeout)
+        return self.context.wrap_socket(sock, server_hostname=self._host)
+
+
+def _email_configured():
+    """E-Mail-Versand ist eingerichtet, wenn ENTWEDER der Brevo-Schlüssel
+    (+ Absender-Adresse) ODER klassische SMTP-Zugangsdaten da sind."""
+    if BREVO_API_KEY and (SMTP_FROM or SMTP_USER):
+        return True
+    return bool(SMTP_USER and SMTP_PASSWORD)
+
+
+def _smtp_send_raw(to_addr, subject, body):
+    """Klassischer SMTP-Versand (funktioniert NICHT auf Render Free —
+    dort sind die SMTP-Ports gesperrt, siehe Kommentar bei BREVO_API_KEY)."""
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = SMTP_FROM
     msg["To"] = to_addr
     if SMTP_PORT == 465:
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        server = _IPv4SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
     else:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+        server = _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
         server.starttls()
     server.login(SMTP_USER, SMTP_PASSWORD)
     server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
     server.quit()
+
+
+def _brevo_send(to_addr, subject, body):
+    """📧 Versand über die Brevo-HTTPS-API (Port 443 — funktioniert auch
+    auf Render Free, wo SMTP-Ports gesperrt sind). Wirft Exception bei
+    Fehlern."""
+    import urllib.request
+    payload = json.dumps({
+        "sender": {"email": SMTP_FROM or SMTP_USER,
+                   "name": BREVO_FROM_NAME},
+        "to": [{"email": to_addr}],
+        "subject": subject,
+        "textContent": body,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email", data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json",
+                 "api-key": BREVO_API_KEY,
+                 "accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        if r.status not in (200, 201, 202):
+            raise RuntimeError(f"Brevo HTTP {r.status}")
+
+
+def _smtp_send(to_addr, subject, body):
+    """Zentraler E-Mail-Versand: Brevo-HTTPS-API zuerst (falls Schlüssel
+    gesetzt — der Weg, der auf Render Free wirklich funktioniert),
+    sonst klassisches SMTP. Name bleibt _smtp_send, damit alle
+    bestehenden Aufrufer unverändert funktionieren."""
+    if BREVO_API_KEY:
+        try:
+            _brevo_send(to_addr, subject, body)
+            return
+        except Exception as e:
+            # Brevo-Fehler mit klarer Meldung durchreichen — und nur dann
+            # noch SMTP probieren, wenn dafür Zugangsdaten da sind.
+            if not (SMTP_USER and SMTP_PASSWORD):
+                raise RuntimeError(f"Brevo-Versand fehlgeschlagen: {e}")
+    try:
+        _smtp_send_raw(to_addr, subject, body)
+    except OSError as e:
+        if "unreachable" in str(e).lower():
+            # Der bekannte Render-Fall — dem Owner eine Meldung geben,
+            # die direkt sagt, was zu tun ist.
+            raise RuntimeError(
+                "SMTP ist auf diesem Hoster gesperrt (Render Free "
+                "blockiert Ports 25/465/587). Lösung: kostenlosen "
+                "BREVO_API_KEY als Umgebungsvariable setzen — Anleitung "
+                "in premium-backend/README.md.")
+        raise
 
 
 @app.route("/api/send-code", methods=["POST", "OPTIONS"])
@@ -406,8 +506,9 @@ def send_code():
     attempts.append(now)
     _email_attempts[to_addr] = attempts
 
-    if not SMTP_USER or not SMTP_PASSWORD:
-        return jsonify({"ok": False, "error": "smtp not configured"}), 503
+    # Konfiguriert = Brevo-Schlüssel ODER klassische SMTP-Zugangsdaten
+    if not _email_configured():
+        return jsonify({"ok": False, "error": "email not configured"}), 503
 
     try:
         subject = subject.replace("{code}", code)
@@ -522,7 +623,7 @@ def admin_grant_premium():
 
     email_sent = True
     email_error = None
-    if SMTP_USER and SMTP_PASSWORD:
+    if _email_configured():
         try:
             subject, body = _gift_email_text(days)
             _smtp_send(email, subject, body)
@@ -531,7 +632,7 @@ def admin_grant_premium():
             email_error = str(e)
     else:
         email_sent = False
-        email_error = "smtp not configured"
+        email_error = "email not configured"
 
     return jsonify({"ok": True, "premium_until": premium_until,
                     "email_sent": email_sent, "email_error": email_error})
