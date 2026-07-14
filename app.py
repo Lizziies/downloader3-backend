@@ -457,14 +457,17 @@ def _smtp_send(to_addr, subject, body):
     sonst klassisches SMTP. Name bleibt _smtp_send, damit alle
     bestehenden Aufrufer unverändert funktionieren."""
     if BREVO_API_KEY:
+        # Wenn ein Brevo-Schlüssel gesetzt ist, NIE auf klassisches SMTP
+        # zurückfallen — SMTP ist auf Render Free eh gesperrt und würde
+        # nur ewig hängen (-> "timeout" in der App statt einer echten
+        # Fehlermeldung). Stattdessen den echten Brevo-Fehler sofort
+        # durchreichen, damit man sieht, was wirklich los ist (z.B.
+        # "Absender nicht verifiziert").
         try:
             _brevo_send(to_addr, subject, body)
             return
         except Exception as e:
-            # Brevo-Fehler mit klarer Meldung durchreichen — und nur dann
-            # noch SMTP probieren, wenn dafür Zugangsdaten da sind.
-            if not (SMTP_USER and SMTP_PASSWORD):
-                raise RuntimeError(f"Brevo-Versand fehlgeschlagen: {e}")
+            raise RuntimeError(f"Brevo-Versand fehlgeschlagen: {e}")
     try:
         _smtp_send_raw(to_addr, subject, body)
     except OSError as e:
