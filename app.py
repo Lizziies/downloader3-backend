@@ -500,11 +500,20 @@ def send_code():
     if not code or len(code) > 12:
         return jsonify({"ok": False, "error": "invalid code"}), 400
 
-    # Missbrauchsschutz: max. 5 E-Mails pro Adresse pro Stunde
+    # 🐛 FIX ("rate limited" bei normaler Nutzung): Das Limit lag bisher
+    # bei nur 5 E-Mails pro Adresse UND STUNDE — das reicht schon bei
+    # ganz normalem Testen/mehrfachem Ein-/Ausloggen oder wenn ein Code
+    # abläuft und neu angefordert wird locker aus, ohne dass irgendwer
+    # etwas missbraucht hat. Jetzt: nur noch ein KURZER Mindestabstand
+    # zwischen zwei Anfragen an dieselbe Adresse (verhindert Doppelklick-
+    # Spam/Skripte), plus ein deutlich großzügigeres Stunden-Limit als
+    # zweite Absicherung — greift bei normaler Nutzung praktisch nie.
     now = datetime.datetime.now()
     attempts = [t for t in _email_attempts.get(to_addr, [])
                if (now - t).total_seconds() < 3600]
-    if len(attempts) >= 5:
+    if attempts and (now - attempts[-1]).total_seconds() < 20:
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    if len(attempts) >= 30:
         return jsonify({"ok": False, "error": "rate limited"}), 429
     attempts.append(now)
     _email_attempts[to_addr] = attempts
