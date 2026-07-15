@@ -1045,6 +1045,78 @@ def _spotify_track_to_item(t):
 
 _SPOTIFY_ID_RE = re.compile(
     r"open\.spotify\.com/(?:intl-\w+/)?(track|playlist|album)/([A-Za-z0-9]+)")
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
+
+
+def _spotify_scrape_embed(kind, sid):
+    """🎧 DRITTER, letzter Ausweg (nach normalem App-Token UND anonymem
+    Web-Player-Token): liest die öffentliche, für iframe-Einbettungen
+    gedachte Embed-Seite (open.spotify.com/embed/...) aus. Diese Seite
+    braucht KEINE Anmeldung/keinen Token-Austausch überhaupt — nur ein
+    einfacher GET-Request auf eine öffentliche HTML-Seite, wie ihn jede
+    Webseite macht, die ein Spotify-Widget einbettet (WhatsApp/Discord-
+    Linkvorschauen funktionieren nach demselben Prinzip). Dadurch deutlich
+    unwahrscheinlicher vom Bot-Schutz blockiert als die eigentlichen
+    Auth-/Token-Endpunkte. Die Song-Liste steckt in einem eingebetteten
+    JSON-Datenblock (__NEXT_DATA__) mitten in der HTML-Seite — die genaue
+    Datenstruktur ist nicht offiziell dokumentiert und kann sich mit
+    Spotify-Updates ändern, deshalb wird hier bewusst nicht auf einen
+    einzigen exakten Pfad im JSON vertraut, sondern das GESAMTE JSON
+    rekursiv nach Objekten durchsucht, die wie ein Song aussehen (entweder
+    im Format der offiziellen API: {"name", "artists": [{"name"}, ...]},
+    oder im vereinfachten Embed-Format: {"title", "subtitle"})."""
+    req = urllib.request.Request(
+        f"https://open.spotify.com/embed/{kind}/{sid}",
+        headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;"
+                     "q=0.9,*/*;q=0.8",
+        })
+    with urllib.request.urlopen(req, timeout=15) as r:
+        html = r.read(3_000_000).decode("utf-8", errors="ignore")
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        raise RuntimeError("embed page: no data block found")
+    data = json.loads(m.group(1))
+
+    items = []
+    seen = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            name = node.get("name")
+            artists = node.get("artists")
+            if (isinstance(name, str) and name
+                    and isinstance(artists, list)):
+                artist_names = ", ".join(
+                    a.get("name", "") for a in artists
+                    if isinstance(a, dict) and a.get("name"))
+                if artist_names:
+                    key = (name, artist_names)
+                    if key not in seen:
+                        seen.add(key)
+                        items.append({"title": name, "artist": artist_names})
+            title = node.get("title")
+            subtitle = node.get("subtitle")
+            if (isinstance(title, str) and title
+                    and isinstance(subtitle, str) and subtitle):
+                key = (title, subtitle)
+                if key not in seen:
+                    seen.add(key)
+                    items.append({"title": title, "artist": subtitle})
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+    if not items:
+        raise RuntimeError("embed page: no tracks parsed")
+    return items
 
 
 def _resolve_spotify(url):
@@ -1052,32 +1124,52 @@ def _resolve_spotify(url):
     if not m:
         raise RuntimeError("invalid spotify url")
     kind, sid = m.group(1), m.group(2)
-    if kind == "track":
-        t = _spotify_get_resilient(f"/tracks/{sid}")
-        item = _spotify_track_to_item(t)
-        if not item:
-            raise RuntimeError("track not found")
-        return [item]
-    if kind == "album":
-        data = _spotify_get_resilient(f"/albums/{sid}/tracks?limit=50")
-        items = [_spotify_track_to_item(t) for t in data.get("items", [])]
-        return [i for i in items if i]
-    # playlist — auf 200 Songs gedeckelt (großzügig, verhindert aber eine
-    # riesige Anfrage bei Mega-Playlists mit tausenden Songs)
-    items = []
-    offset = 0
-    while offset < 200:
-        data = _spotify_get_resilient(
-            f"/playlists/{sid}/tracks?limit=50&offset={offset}"
-            "&fields=items(track(name,artists(name))),next")
-        for entry in data.get("items", []):
-            item = _spotify_track_to_item(entry.get("track"))
-            if item:
-                items.append(item)
-        if not data.get("next"):
-            break
-        offset += 50
-    return items
+    try:
+        if kind == "track":
+            t = _spotify_get_resilient(f"/tracks/{sid}")
+            item = _spotify_track_to_item(t)
+            if not item:
+                raise RuntimeError("track not found")
+            return [item]
+        if kind == "album":
+            data = _spotify_get_resilient(f"/albums/{sid}/tracks?limit=50")
+            items = [_spotify_track_to_item(t)
+                     for t in data.get("items", [])]
+            items = [i for i in items if i]
+            if not items:
+                raise RuntimeError("no tracks")
+            return items
+        # playlist — auf 200 Songs gedeckelt (großzügig, verhindert aber
+        # eine riesige Anfrage bei Mega-Playlists mit tausenden Songs)
+        items = []
+        offset = 0
+        while offset < 200:
+            data = _spotify_get_resilient(
+                f"/playlists/{sid}/tracks?limit=50&offset={offset}"
+                "&fields=items(track(name,artists(name))),next")
+            for entry in data.get("items", []):
+                item = _spotify_track_to_item(entry.get("track"))
+                if item:
+                    items.append(item)
+            if not data.get("next"):
+                break
+            offset += 50
+        if not items:
+            raise RuntimeError("no tracks")
+        return items
+    except Exception as original_error:
+        # 🐛 FIX ("blocked on every available access path" trotz
+        # vorherigem Cookie-/Header-Fix): Weder der normale App-Token
+        # noch der anonyme Web-Player-Token (beide über
+        # _spotify_get_resilient) kamen durch — als letzten Ausweg jetzt
+        # die öffentliche Embed-Seite versuchen (siehe
+        # _spotify_scrape_embed oben). Schlägt AUCH das fehl, wird die
+        # ursprüngliche Fehlermeldung weitergereicht, nicht die vom
+        # Embed-Versuch — die beschreibt den eigentlichen Grund besser.
+        try:
+            return _spotify_scrape_embed(kind, sid)
+        except Exception:
+            raise original_error
 
 
 def _scrape_page_title_artist(url):
