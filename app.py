@@ -27,6 +27,7 @@ import smtplib
 from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
+import http.cookiejar
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -935,16 +936,54 @@ def _spotify_anon_token():
     den open.spotify.com selbst für nicht eingeloggte Besucher benutzt.
     Hat KEINE Einschränkung bei Spotify-eigenen algorithmischen
     Playlists (anders als der normale App-Zugangs-Token oben) — genau
-    deshalb hier als Ausweg für genau diesen Fall genutzt."""
+    deshalb hier als Ausweg für genau diesen Fall genutzt.
+
+    🐛 FIX ("HTTP Error 403: URL Blocked"): Der erste, einfache Versuch
+    (nur "get_access_token" ohne vorherigen Seitenaufruf/Cookies, ohne
+    Referer/Accept-Header, mit productType=embed) wurde von Spotifys
+    Bot-Schutz erkannt und direkt blockiert — echte Browser laden IMMER
+    zuerst die Seite selbst (wodurch Sitzungs-Cookies gesetzt werden)
+    und schicken bei der Token-Anfrage danach passende Referer-/
+    Accept-/App-Platform-Header mit. Genau dieses zweistufige,
+    browser-typische Verhalten wird jetzt nachgebildet: 1) einmal
+    open.spotify.com laden (setzt die nötigen Cookies über einen
+    gemeinsamen Cookie-Speicher), 2) danach get_access_token MIT diesen
+    Cookies und vollständigen Browser-Headern abfragen."""
     now = datetime.datetime.now()
     cached = _spotify_anon_token_cache
     if cached["token"] and cached["expires"] and now < cached["expires"]:
         return cached["token"]
-    req = urllib.request.Request(
+
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar))
+
+    # 1) Einmal die echte Seite laden, damit Spotify die üblichen
+    #    Sitzungs-Cookies setzt (ohne die wird der Token-Endpunkt als
+    #    Bot erkannt und blockiert).
+    home_req = urllib.request.Request(
+        "https://open.spotify.com/", headers={
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;"
+                     "q=0.9,*/*;q=0.8",
+        })
+    with opener.open(home_req, timeout=15):
+        pass
+
+    # 2) Jetzt den Token mit den gesetzten Cookies + vollständigen,
+    #    browser-typischen Headern abfragen.
+    token_req = urllib.request.Request(
         "https://open.spotify.com/get_access_token"
-        "?reason=transport&productType=embed",
-        headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+        "?reason=transport&productType=web-player",
+        headers={
+            "User-Agent": ua,
+            "Accept": "application/json",
+            "Referer": "https://open.spotify.com/",
+            "App-Platform": "WebPlayer",
+        })
+    with opener.open(token_req, timeout=15) as r:
         data = json.loads(r.read().decode())
     token = data.get("accessToken")
     if not token:
@@ -970,12 +1009,27 @@ def _spotify_get_resilient(path):
     except urllib.error.HTTPError as he:
         if he.code not in (403, 404):
             raise
-        token = _spotify_anon_token()
-        req = urllib.request.Request(
-            f"https://api.spotify.com/v1{path}",
-            headers={"Authorization": f"Bearer {token}"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode())
+        try:
+            token = _spotify_anon_token()
+            req = urllib.request.Request(
+                f"https://api.spotify.com/v1{path}",
+                headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            # 🐛 Beide Wege (normaler App-Token UND anonymer
+            # Web-Player-Token) sind fehlgeschlagen — ein klarerer,
+            # verständlicher Fehler ist hier hilfreicher als die rohe
+            # zweite Exception (z. B. ein kryptisches "URL Blocked"),
+            # die sonst den eigentlichen Grund (Spotify-eigene,
+            # algorithmische Playlist nicht abrufbar) verschleiern
+            # würde.
+            raise RuntimeError(
+                "spotify blocked this playlist/album on every available "
+                "access path (this can happen for Spotify's own "
+                "algorithmic/editorial playlists) — please try a "
+                "different, self-created playlist, or add the songs as "
+                "individual track links instead")
 
 
 def _spotify_track_to_item(t):
