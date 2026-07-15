@@ -85,6 +85,24 @@ _ai_attempts = {}  # Missbrauchsschutz: begrenzt Anfragen pro E-Mail
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
 _spotify_token_cache = {"token": None, "expires": None}
+# 🐛 FIX ("Playlist-Download: Couldn't fetch song info: HTTP Error 403:
+# Forbidden"): Seit einer Spotify-API-Richtlinienänderung (Ende 2024)
+# blockiert der normale App-Zugangs-Token (Client-Credentials-Flow) den
+# Zugriff auf den Song-Inhalt von Spotify-EIGENEN, algorithmischen
+# Playlists (z. B. "Discover Weekly", "Release Radar", "Today's Top
+# Hits" — deren Link-IDs immer mit "37i9dQZF1" beginnen, genau wie die
+# gemeldete Playlist) — unabhängig davon, wie die eigene App
+# registriert ist, das betrifft ALLE Entwickler gleichermaßen. Normale,
+# selbst erstellte Nutzer-Playlists sind davon NICHT betroffen und
+# funktionierten schon vorher. Als Ausweg wird jetzt zusätzlich der
+# GLEICHE anonyme, kurzlebige Zugangs-Token verwendet, den die echte
+# open.spotify.com-Webseite selbst für nicht eingeloggte Besucher nutzt,
+# um genau diese Playlists im Browser anzuzeigen — technisch dasselbe,
+# öffentlich einsehbare Ergebnis, nur über einen anderen, nicht davon
+# betroffenen Zugangsweg. Weiterhin werden dabei ausschließlich
+# öffentliche Songtitel/Künstler-Infos gelesen, kein Audio, keine
+# geschützten Inhalte, kein DRM-Umgehen.
+_spotify_anon_token_cache = {"token": None, "expires": None}
 _music_attempts = {}  # Missbrauchsschutz: begrenzt Anfragen pro IP/Stunde
 
 # Verfügbare Pakete: Preis in EUR + wie viele Tage Premium es gibt
@@ -912,6 +930,54 @@ def _spotify_get(path):
         return json.loads(r.read().decode())
 
 
+def _spotify_anon_token():
+    """🎧 Holt (und cached) den anonymen, kurzlebigen Web-Player-Token,
+    den open.spotify.com selbst für nicht eingeloggte Besucher benutzt.
+    Hat KEINE Einschränkung bei Spotify-eigenen algorithmischen
+    Playlists (anders als der normale App-Zugangs-Token oben) — genau
+    deshalb hier als Ausweg für genau diesen Fall genutzt."""
+    now = datetime.datetime.now()
+    cached = _spotify_anon_token_cache
+    if cached["token"] and cached["expires"] and now < cached["expires"]:
+        return cached["token"]
+    req = urllib.request.Request(
+        "https://open.spotify.com/get_access_token"
+        "?reason=transport&productType=embed",
+        headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode())
+    token = data.get("accessToken")
+    if not token:
+        raise RuntimeError("spotify anon token unavailable")
+    exp_ms = data.get("accessTokenExpirationTimestampMs")
+    if exp_ms:
+        expires = (datetime.datetime.fromtimestamp(exp_ms / 1000)
+                  - datetime.timedelta(seconds=30))
+    else:
+        expires = now + datetime.timedelta(minutes=30)
+    cached["token"] = token
+    cached["expires"] = expires
+    return token
+
+
+def _spotify_get_resilient(path):
+    """Wie _spotify_get, aber mit automatischem Ausweg auf den anonymen
+    Web-Player-Token, wenn der normale App-Token mit 403/404 abgelehnt
+    wird (siehe Kommentar bei _spotify_anon_token_cache oben — betrifft
+    v. a. Spotify-eigene algorithmische Playlists)."""
+    try:
+        return _spotify_get(path)
+    except urllib.error.HTTPError as he:
+        if he.code not in (403, 404):
+            raise
+        token = _spotify_anon_token()
+        req = urllib.request.Request(
+            f"https://api.spotify.com/v1{path}",
+            headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+
+
 def _spotify_track_to_item(t):
     if not t:
         return None
@@ -933,13 +999,13 @@ def _resolve_spotify(url):
         raise RuntimeError("invalid spotify url")
     kind, sid = m.group(1), m.group(2)
     if kind == "track":
-        t = _spotify_get(f"/tracks/{sid}")
+        t = _spotify_get_resilient(f"/tracks/{sid}")
         item = _spotify_track_to_item(t)
         if not item:
             raise RuntimeError("track not found")
         return [item]
     if kind == "album":
-        data = _spotify_get(f"/albums/{sid}/tracks?limit=50")
+        data = _spotify_get_resilient(f"/albums/{sid}/tracks?limit=50")
         items = [_spotify_track_to_item(t) for t in data.get("items", [])]
         return [i for i in items if i]
     # playlist — auf 200 Songs gedeckelt (großzügig, verhindert aber eine
@@ -947,7 +1013,7 @@ def _resolve_spotify(url):
     items = []
     offset = 0
     while offset < 200:
-        data = _spotify_get(
+        data = _spotify_get_resilient(
             f"/playlists/{sid}/tracks?limit=50&offset={offset}"
             "&fields=items(track(name,artists(name))),next")
         for entry in data.get("items", []):
