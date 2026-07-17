@@ -605,6 +605,62 @@ def send_code():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+_contact_attempts = {}  # Missbrauchsschutz: begrenzt Kontakt-Nachrichten pro Absender
+
+
+@app.route("/api/contact-owner", methods=["POST", "OPTIONS"])
+def contact_owner():
+    """✉️ Schickt eine Nachricht aus der App an BEIDE Owner per E-Mail —
+    über die SERVER-eigenen Zugangsdaten (Brevo/SMTP), NICHT über
+    irgendwelche lokalen Einstellungen auf dem Gerät der schreibenden
+    Person (die hat ja normalerweise gar kein eigenes SMTP eingerichtet
+    — nur der Owner selbst). Genau DAS war der Grund, warum das
+    'Probleme/Feedback'- und das neue Helfer-Kontaktformular vorher nur
+    auf dem PC des Owners funktionierten, weltweit aber sonst nirgends
+    — jetzt läuft der Versand zentral über diesen Server, für jede
+    Person überall."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    sender = (data.get("email") or "").strip().lower()
+    message = (data.get("message") or "").strip()
+    context = (data.get("context") or "contact").strip()[:40]
+
+    if not message:
+        return jsonify({"ok": False, "error": "empty message"}), 400
+    if len(message) > 4000:
+        return jsonify({"ok": False, "error": "message too long"}), 400
+
+    now = datetime.datetime.now()
+    key = sender or "anon"
+    attempts = [t for t in _contact_attempts.get(key, [])
+               if (now - t).total_seconds() < 3600]
+    if attempts and (now - attempts[-1]).total_seconds() < 15:
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    if len(attempts) >= 10:
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    attempts.append(now)
+    _contact_attempts[key] = attempts
+
+    if not _email_configured():
+        return jsonify({"ok": False, "error": "email not configured"}), 503
+
+    subject = f"Downloader<3 — {context}: Nachricht von {sender or 'anonym'}"
+    body = f"Von: {sender or 'anonym'}\nBereich: {context}\n\n{message}"
+
+    any_ok = False
+    last_error = None
+    for owner in OWNER_EMAILS:
+        try:
+            _smtp_send(owner, subject, body)
+            any_ok = True
+        except Exception as e:
+            last_error = str(e)
+    if any_ok:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": last_error or "send failed"}), 500
+
+
 @app.route("/api/backup-settings", methods=["POST", "OPTIONS"])
 def backup_settings():
     """☁️ Speichert eine komplette Sicherung (Einstellungen, Verlauf,
