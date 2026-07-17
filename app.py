@@ -604,51 +604,72 @@ def _email_configured():
     return bool(SMTP_USER and SMTP_PASSWORD)
 
 
-def _smtp_send_raw(to_addr, subject, body):
+def _smtp_send_raw(to_addr, subject, body, attachment=None):
     """Klassischer SMTP-Versand (funktioniert NICHT auf Render Free —
-    dort sind die SMTP-Ports gesperrt, siehe Kommentar bei BREVO_API_KEY)."""
-    msg = MIMEText(body)
+    dort sind die SMTP-Ports gesperrt, siehe Kommentar bei BREVO_API_KEY).
+    `attachment` (optional): {"name": str, "content_b64": str}."""
+    if attachment:
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.base import MIMEBase
+        from email import encoders
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body))
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(base64.b64decode(attachment["content_b64"]))
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition",
+                        f'attachment; filename="{attachment["name"]}"')
+        msg.attach(part)
+    else:
+        msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = SMTP_FROM
     msg["To"] = to_addr
     if SMTP_PORT == 465:
-        server = _IPv4SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        server = _IPv4SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
     else:
-        server = _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+        server = _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
         server.starttls()
     server.login(SMTP_USER, SMTP_PASSWORD)
     server.sendmail(SMTP_FROM, [to_addr], msg.as_string())
     server.quit()
 
 
-def _brevo_send(to_addr, subject, body):
+def _brevo_send(to_addr, subject, body, attachment=None):
     """📧 Versand über die Brevo-HTTPS-API (Port 443 — funktioniert auch
     auf Render Free, wo SMTP-Ports gesperrt sind). Wirft Exception bei
-    Fehlern."""
+    Fehlern. `attachment` (optional): {"name": str, "content_b64": str}
+    -- Brevo nimmt Anhänge direkt als Base64 im JSON-Payload entgegen."""
     import urllib.request
-    payload = json.dumps({
+    payload = {
         "sender": {"email": SMTP_FROM or SMTP_USER,
                    "name": BREVO_FROM_NAME},
         "to": [{"email": to_addr}],
         "subject": subject,
         "textContent": body,
-    }).encode()
+    }
+    if attachment:
+        payload["attachment"] = [{
+            "content": attachment["content_b64"],
+            "name": attachment["name"],
+        }]
     req = urllib.request.Request(
-        "https://api.brevo.com/v3/smtp/email", data=payload,
+        "https://api.brevo.com/v3/smtp/email", data=json.dumps(payload).encode(),
         method="POST",
         headers={"Content-Type": "application/json",
                  "api-key": BREVO_API_KEY,
                  "accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=60) as r:
         if r.status not in (200, 201, 202):
             raise RuntimeError(f"Brevo HTTP {r.status}")
 
 
-def _smtp_send(to_addr, subject, body):
+def _smtp_send(to_addr, subject, body, attachment=None):
     """Zentraler E-Mail-Versand: Brevo-HTTPS-API zuerst (falls Schlüssel
     gesetzt — der Weg, der auf Render Free wirklich funktioniert),
     sonst klassisches SMTP. Name bleibt _smtp_send, damit alle
-    bestehenden Aufrufer unverändert funktionieren."""
+    bestehenden Aufrufer unverändert funktionieren. `attachment`
+    (optional): {"name": str, "content_b64": str}."""
     if BREVO_API_KEY:
         # Wenn ein Brevo-Schlüssel gesetzt ist, NIE auf klassisches SMTP
         # zurückfallen — SMTP ist auf Render Free eh gesperrt und würde
@@ -657,12 +678,12 @@ def _smtp_send(to_addr, subject, body):
         # durchreichen, damit man sieht, was wirklich los ist (z.B.
         # "Absender nicht verifiziert").
         try:
-            _brevo_send(to_addr, subject, body)
+            _brevo_send(to_addr, subject, body, attachment)
             return
         except Exception as e:
             raise RuntimeError(f"Brevo-Versand fehlgeschlagen: {e}")
     try:
-        _smtp_send_raw(to_addr, subject, body)
+        _smtp_send_raw(to_addr, subject, body, attachment)
     except OSError as e:
         if "unreachable" in str(e).lower():
             # Der bekannte Render-Fall — dem Owner eine Meldung geben,
@@ -778,6 +799,117 @@ def contact_owner():
     if any_ok:
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": last_error or "send failed"}), 500
+
+
+# 🐛 WICHTIG: E-Mail-Anhänge haben ÜBERALL (Gmail, Outlook, Brevo, jeder
+# SMTP-Server) eine harte Größengrenze — meist irgendwo zwischen 10 und
+# 25 MB, je nach Anbieter. Das ist kein Limit dieser App, sondern eine
+# technische Grenze von E-Mail selbst. Deshalb: kleine Dateien gehen als
+# echter Anhang raus (SMALL_ATTACH_LIMIT, bewusst konservativ gewählt,
+# damit Base64-Overhead + JSON nirgends anecken), alles Größere schickt
+# die App stattdessen als Download-LINK (Datei wird vom Gerät des
+# Nutzers direkt zu einem Datei-Hoster hochgeladen, siehe main.py) --
+# so "klappt" der Versand am Ende wirklich für jede Dateigröße, nur eben
+# nicht immer als klassischer Anhang.
+SMALL_ATTACH_LIMIT = 6 * 1024 * 1024  # 6 MB Rohdatei (~8.2 MB Base64)
+_file_send_attempts = {}  # Missbrauchsschutz pro Absender
+
+
+def _file_send_rate_limited(sender):
+    now = datetime.datetime.now()
+    key = sender or "anon"
+    attempts = [t for t in _file_send_attempts.get(key, [])
+               if (now - t).total_seconds() < 3600]
+    if attempts and (now - attempts[-1]).total_seconds() < 10:
+        return True
+    if len(attempts) >= 20:
+        return True
+    attempts.append(now)
+    _file_send_attempts[key] = attempts
+    return False
+
+
+@app.route("/api/send-file", methods=["POST", "OPTIONS"])
+def send_file():
+    """📤 Verschickt eine kleine Datei (<= SMALL_ATTACH_LIMIT) als
+    ECHTEN E-Mail-Anhang an eine beliebige Adresse. Für größere Dateien
+    nutzt die App stattdessen /api/send-file-link (siehe dort/main.py)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    sender = (data.get("from_email") or "").strip().lower()
+    to_addr = (data.get("to") or "").strip()
+    message = (data.get("message") or "").strip()[:2000]
+    filename = (data.get("filename") or "datei").strip()[:120]
+    content_b64 = data.get("content_b64") or ""
+
+    if "@" not in to_addr or "." not in to_addr.split("@")[-1]:
+        return jsonify({"ok": False, "error": "invalid recipient"}), 400
+    if not content_b64:
+        return jsonify({"ok": False, "error": "missing file"}), 400
+    # Base64 ist ca. 4/3 der Rohgröße -- grobe Vorab-Prüfung ohne alles
+    # zu dekodieren.
+    if len(content_b64) > SMALL_ATTACH_LIMIT * 4 // 3 + 1024:
+        return jsonify({"ok": False, "error": "file too large"}), 413
+    if _file_send_rate_limited(sender):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    if not _email_configured():
+        return jsonify({"ok": False, "error": "email not configured"}), 503
+
+    subject = f"📎 {sender or 'Jemand'} hat dir eine Datei über Downloader<3 geschickt"
+    body = (
+        f"Hey!\n\n{sender or 'Jemand'} hat dir über die Downloader<3-App "
+        f"eine Datei geschickt: {filename}\n"
+        + (f"\nNachricht:\n{message}\n" if message else "")
+        + "\nDie Datei hängt an dieser E-Mail an. 💜"
+    )
+    try:
+        _smtp_send(to_addr, subject, body,
+                  attachment={"name": filename, "content_b64": content_b64})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/send-file-link", methods=["POST", "OPTIONS"])
+def send_file_link():
+    """📤 Für Dateien, die für einen normalen E-Mail-Anhang zu groß sind:
+    die App lädt die Datei vorher selbst zu einem Datei-Hoster hoch
+    (client-seitig, siehe main.py) und schickt hier nur noch eine
+    E-Mail mit dem fertigen Download-Link -- funktioniert dadurch
+    unabhängig von der Dateigröße."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    sender = (data.get("from_email") or "").strip().lower()
+    to_addr = (data.get("to") or "").strip()
+    message = (data.get("message") or "").strip()[:2000]
+    filename = (data.get("filename") or "datei").strip()[:120]
+    link = (data.get("link") or "").strip()
+
+    if "@" not in to_addr or "." not in to_addr.split("@")[-1]:
+        return jsonify({"ok": False, "error": "invalid recipient"}), 400
+    if not link.startswith("http"):
+        return jsonify({"ok": False, "error": "invalid link"}), 400
+    if _file_send_rate_limited(sender):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+    if not _email_configured():
+        return jsonify({"ok": False, "error": "email not configured"}), 503
+
+    subject = f"📎 {sender or 'Jemand'} hat dir eine Datei über Downloader<3 geschickt"
+    body = (
+        f"Hey!\n\n{sender or 'Jemand'} hat dir über die Downloader<3-App "
+        f"eine Datei geschickt: {filename}\n"
+        + (f"\nNachricht:\n{message}\n" if message else "")
+        + f"\n⬇ Download: {link}\n\n"
+        "(Die Datei war zu groß für einen normalen E-Mail-Anhang, "
+        "deshalb hier als Link -- er läuft nach einiger Zeit automatisch ab.)"
+    )
+    try:
+        _smtp_send(to_addr, subject, body)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/backup-settings", methods=["POST", "OPTIONS"])
