@@ -138,7 +138,12 @@ def db():
         last_seen TEXT
     )""")
     # Migration für bereits bestehende Datenbanken ohne diese Spalten
-    for col in ("first_seen", "last_seen"):
+    # 🤝 role: NULL/"" = normaler Nutzer, "helper" = Helfer-Rang (siehe
+    # unten). last_helper_code_at: wann ein Helper zuletzt einen eigenen
+    # Gutscheincode erstellt hat — für die 2-Wochen-Abklingzeit, serverseitig
+    # geprüft (nicht nur lokal in der App), damit sie weltweit gilt und
+    # sich nicht durch Neuinstallation umgehen lässt.
+    for col in ("first_seen", "last_seen", "role", "last_helper_code_at"):
         try:
             conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
@@ -205,6 +210,40 @@ def _upsert_premium(email, premium_until):
         "ON CONFLICT(email) DO UPDATE SET premium_until=excluded.premium_until, "
         "updated_at=excluded.updated_at",
         (email, new_value, datetime.datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def _get_role(email):
+    """🤝 Liest den aktuellen Rang (z. B. "helper") einer E-Mail-Adresse
+    aus der weltweiten Konten-Datenbank — leerer/​None-Wert = normaler
+    Nutzer."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    conn = db()
+    row = conn.execute(
+        "SELECT role FROM accounts WHERE email = ?", (email,)
+    ).fetchone()
+    conn.close()
+    return (row[0] or None) if row else None
+
+
+def _set_role(email, role):
+    """🤝 Setzt/entfernt den Rang einer E-Mail-Adresse weltweit (legt das
+    Konto an, falls es noch gar nicht existiert — z. B. wenn der Owner
+    jemanden befördert, der die App noch nie geöffnet hat)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    conn = db()
+    now = datetime.datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO accounts (email, premium_until, updated_at, "
+        "first_seen, last_seen, role) VALUES (?, NULL, ?, ?, ?, ?) "
+        "ON CONFLICT(email) DO UPDATE SET role=excluded.role, "
+        "updated_at=excluded.updated_at",
+        (email, now, now, now, role))
     conn.commit()
     conn.close()
 
@@ -371,10 +410,11 @@ def account_status():
     _touch_account(email)  # merkt sich: diese E-Mail nutzt die App
     conn = db()
     row = conn.execute(
-        "SELECT premium_until FROM accounts WHERE email = ?", (email,)
+        "SELECT premium_until, role FROM accounts WHERE email = ?", (email,)
     ).fetchone()
     conn.close()
-    return jsonify({"premium_until": row[0] if row else None})
+    return jsonify({"premium_until": row[0] if row else None,
+                    "role": (row[1] if row else None) or None})
 
 
 _owner_attempts = {}  # simple In-Memory-Schutz gegen wiederholtes Ausprobieren
@@ -699,13 +739,180 @@ def admin_list_accounts():
 
     conn = db()
     rows = conn.execute(
-        "SELECT email, premium_until, first_seen, last_seen "
+        "SELECT email, premium_until, first_seen, last_seen, role "
         "FROM accounts ORDER BY last_seen DESC"
     ).fetchall()
     conn.close()
+    # 🌍 last_seen bleibt bewusst drin, auch wenn null/alt — die Liste zeigt
+    # ALLE jemals bekannten Konten, nicht nur gerade aktive/online Nutzer,
+    # damit der Owner z. B. zufällig jemandem etwas schenken kann, der die
+    # App gerade nicht offen hat.
     accounts = [{"email": r[0], "premium_until": r[1],
-                "first_seen": r[2], "last_seen": r[3]} for r in rows]
+                "first_seen": r[2], "last_seen": r[3],
+                "role": r[4] or None} for r in rows]
     return jsonify({"ok": True, "accounts": accounts})
+
+
+@app.route("/api/admin-revoke-premium", methods=["POST", "OPTIONS"])
+def admin_revoke_premium():
+    """👑 Owner-only: entzieht einer E-Mail-Adresse ihr Premium wieder —
+    weltweit (wirkt auf das Server-Konto, nicht nur ein einzelnes Gerät),
+    geschützt durchs selbe Owner-Passwort."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    owner_password = data.get("owner_password") or ""
+    email = (data.get("email") or "").strip().lower()
+    if not OWNER_PASSWORD or owner_password != OWNER_PASSWORD:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not email:
+        return jsonify({"ok": False, "error": "missing email"}), 400
+    if email in OWNER_EMAILS:
+        return jsonify({"ok": False, "error": "cannot modify owner"}), 400
+
+    conn = db()
+    conn.execute(
+        "UPDATE accounts SET premium_until = NULL, updated_at = ? "
+        "WHERE email = ?",
+        (datetime.datetime.now().isoformat(), email))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin-delete-account", methods=["POST", "OPTIONS"])
+def admin_delete_account():
+    """👑 Owner-only: löscht ein Konto (E-Mail, Premium-Status, Rang,
+    Cloud-Sicherung) komplett und weltweit vom Server — geschützt durchs
+    Owner-Passwort. Owner-Konten selbst können nicht gelöscht werden."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    owner_password = data.get("owner_password") or ""
+    email = (data.get("email") or "").strip().lower()
+    if not OWNER_PASSWORD or owner_password != OWNER_PASSWORD:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not email:
+        return jsonify({"ok": False, "error": "missing email"}), 400
+    if email in OWNER_EMAILS:
+        return jsonify({"ok": False, "error": "cannot delete owner"}), 400
+
+    conn = db()
+    conn.execute("DELETE FROM accounts WHERE email = ?", (email,))
+    conn.execute("DELETE FROM user_backups WHERE email = ?", (email,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin-set-helper", methods=["POST", "OPTIONS"])
+def admin_set_helper():
+    """🤝 Owner-only: befördert eine E-Mail-Adresse weltweit zum
+    Helfer-Rang (oder stuft sie wieder zurück). Helfer bekommen
+    automatisch unbegrenztes Premium und dürfen alle 2 Wochen selbst
+    einen kleinen Gutscheincode (max. 5 Tage) erstellen — siehe
+    /api/helper-create-code."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    owner_password = data.get("owner_password") or ""
+    email = (data.get("email") or "").strip().lower()
+    promote = data.get("promote", True)
+    if not OWNER_PASSWORD or owner_password != OWNER_PASSWORD:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"ok": False, "error": "invalid email"}), 400
+
+    if promote:
+        _set_role(email, "helper")
+        _upsert_premium(email, "forever")  # Helfer = unbegrenzt Premium
+    else:
+        _set_role(email, None)
+    return jsonify({"ok": True, "role": "helper" if promote else None})
+
+
+@app.route("/api/admin-create-code", methods=["POST", "OPTIONS"])
+def admin_create_code():
+    """👑 Owner-only: erstellt einen Geschenk-Code SERVERSEITIG (statt nur
+    lokal in der App), damit er wirklich weltweit bei jeder Person
+    funktioniert, egal auf welchem Gerät sie ihn einlöst — genau der Fix
+    für den Bug, dass Owner-Codes vorher nur auf dem eigenen Gerät
+    gültig waren."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    owner_password = data.get("owner_password") or ""
+    days = data.get("days")  # int oder None (= für immer)
+    if not OWNER_PASSWORD or owner_password != OWNER_PASSWORD:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if days is not None:
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "invalid days"}), 400
+
+    code = make_code()
+    conn = db()
+    conn.execute(
+        "INSERT INTO codes (code, days, order_id, plan, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (code, days, "admin-gift", "gift",
+         datetime.datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "code": code, "days": days})
+
+
+@app.route("/api/helper-create-code", methods=["POST", "OPTIONS"])
+def helper_create_code():
+    """🤝 Für Helfer: erstellt alle 2 Wochen einen eigenen Gutscheincode
+    (max. 5 Tage Premium) — komplett serverseitig geprüft (Rang +
+    Abklingzeit), damit sich das nicht durch eine neue Geräte-
+    Installation umgehen lässt."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    days = data.get("days", 5)
+    if not email:
+        return jsonify({"ok": False, "error": "missing email"}), 400
+    if _get_role(email) != "helper":
+        return jsonify({"ok": False, "error": "not a helper"}), 403
+    try:
+        days = max(1, min(5, int(days)))
+    except (TypeError, ValueError):
+        days = 5
+
+    conn = db()
+    row = conn.execute(
+        "SELECT last_helper_code_at FROM accounts WHERE email = ?",
+        (email,)).fetchone()
+    last = row[0] if row else None
+    now = datetime.datetime.now()
+    if last:
+        try:
+            elapsed = now - datetime.datetime.fromisoformat(last)
+        except ValueError:
+            elapsed = datetime.timedelta(days=999)
+        if elapsed.total_seconds() < 14 * 24 * 3600:
+            remaining = 14 * 24 * 3600 - elapsed.total_seconds()
+            conn.close()
+            return jsonify({
+                "ok": False, "error": "cooldown",
+                "hours_left": int(remaining // 3600) + 1,
+            }), 429
+
+    code = make_code()
+    conn.execute(
+        "INSERT INTO codes (code, days, order_id, plan, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (code, days, "helper-gift", "helper-gift", now.isoformat()))
+    conn.execute(
+        "UPDATE accounts SET last_helper_code_at = ? WHERE email = ?",
+        (now.isoformat(), email))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "code": code, "days": days})
 
 
 def _check_ai_rate_limit(identifier, max_per_hour):
