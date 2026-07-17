@@ -734,6 +734,41 @@ def _gift_email_text(days):
     return subject, body
 
 
+def _helper_email_text():
+    """Baut eine zweisprachige (DE + EN) Glückwunsch-Mail für neue
+    Helfer — genau wie bei _gift_email_text() beim Premium-Verschenken,
+    nur mit den Helfer-Vorteilen statt reinem Premium."""
+    subject = "🤝 Downloader<3 — Du bist jetzt Helfer! / You're now a Helper!"
+    body = (
+        "🇩🇪 Deutsch\n"
+        "Herzlichen Glückwunsch! Du bist jetzt offiziell Helfer bei "
+        "Downloader<3 — vielen Dank für deine Unterstützung! 🎉\n\n"
+        "Das bringt dir:\n"
+        "★ Unbegrenztes Premium, für immer, komplett kostenlos\n"
+        "🎁 Alle 2 Wochen einen eigenen Gutscheincode (bis zu 5 Tage "
+        "Premium) erstellen und verschenken\n"
+        "🤝 Einen eigenen Helfer-Bereich in der App\n\n"
+        "Öffne einfach Downloader<3 auf deinem Gerät (mit derselben "
+        "E-Mail-Adresse, an die diese Nachricht ging) — im neuen "
+        "'Helfer'-Tab in der Seitenleiste findest du alles.\n\n"
+        "— Lisa & Felix\n\n"
+        "―――――――――――――――――――――――\n\n"
+        "🇬🇧 English\n"
+        "Congratulations! You're now officially a Helper at "
+        "Downloader<3 — thank you for your support! 🎉\n\n"
+        "This gets you:\n"
+        "★ Unlimited Premium, forever, completely free\n"
+        "🎁 Create and give away your own voucher code every 2 weeks "
+        "(up to 5 days of Premium)\n"
+        "🤝 Your own Helper area in the app\n\n"
+        "Just open Downloader<3 on your device (using the same email "
+        "address this message was sent to) — you'll find everything in "
+        "the new 'Helper' tab in the sidebar.\n\n"
+        "— Lisa & Felix"
+    )
+    return subject, body
+
+
 @app.route("/api/admin-grant-premium", methods=["POST", "OPTIONS"])
 def admin_grant_premium():
     """🎁 Owner-only: schenkt einer beliebigen E-Mail-Adresse Premium
@@ -889,12 +924,27 @@ def admin_set_helper():
         # machen ist sinnlos und wird deshalb blockiert.
         return jsonify({"ok": False, "error": "cannot set owner role"}), 400
 
+    email_sent = True
+    email_error = None
     if promote:
         _set_role(email, "helper")
         _upsert_premium(email, "forever")  # Helfer = unbegrenzt Premium
+        # 🎉 Genau wie beim Premium-Verschenken (admin-grant-premium) bekommt
+        # die beförderte Person eine zweisprachige Glückwunsch-Mail.
+        if _email_configured():
+            try:
+                subject, body = _helper_email_text()
+                _smtp_send(email, subject, body)
+            except Exception as e:
+                email_sent = False
+                email_error = str(e)
+        else:
+            email_sent = False
+            email_error = "email not configured"
     else:
         _set_role(email, None)
-    return jsonify({"ok": True, "role": "helper" if promote else None})
+    return jsonify({"ok": True, "role": "helper" if promote else None,
+                    "email_sent": email_sent, "email_error": email_error})
 
 
 @app.route("/api/admin-create-code", methods=["POST", "OPTIONS"])
