@@ -751,6 +751,11 @@ def admin_grant_premium():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     if "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"ok": False, "error": "invalid email"}), 400
+    if email in OWNER_EMAILS:
+        # Owner haben ohnehin schon immer unbegrenztes Premium — sich
+        # selbst oder sich gegenseitig hier zusätzlich "beschenken" ist
+        # sinnlos und wird deshalb blockiert.
+        return jsonify({"ok": False, "error": "cannot gift owner"}), 400
 
     if days is None:
         premium_until = "forever"
@@ -878,6 +883,11 @@ def admin_set_helper():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     if "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"ok": False, "error": "invalid email"}), 400
+    if email in OWNER_EMAILS:
+        # Owner sind schon automatisch "über" jedem Rang (unbegrenztes
+        # Premium sowieso) — sich selbst/sich gegenseitig zum Helfer
+        # machen ist sinnlos und wird deshalb blockiert.
+        return jsonify({"ok": False, "error": "cannot set owner role"}), 400
 
     if promote:
         _set_role(email, "helper")
