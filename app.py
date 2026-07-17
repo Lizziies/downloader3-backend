@@ -1337,6 +1337,11 @@ def helper_create_code():
     return jsonify({"ok": True, "code": code, "days": days})
 
 
+# 🏆 Max. Länge eines Ehrentafel-Anzeigenamens — MUSS zum entsprechenden
+# HONOR_NAME_MAX_LEN in main.py passen, damit Client und Server dieselbe
+# Grenze durchsetzen (statt wie vorher ein stilles Abschneiden bei 40).
+HONOR_NAME_MAX_LEN = 24
+
 # 🛡 Ehrentafel-Filter: verhindert, dass jemand Schimpfwörter/Beleidigungen
 # als "Anzeigename" auf der öffentlichen Webseite platziert. Bewusst nur
 # eine Basisliste gängiger deutscher/englischer Schimpfwort-Fragmente —
@@ -1377,7 +1382,10 @@ def helper_set_public():
         return "", 204
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
-    public_name = (data.get("public_name") or "").strip()[:40]
+    # ✂ Bewusst NICHT mehr still auf eine Länge abschneiden (früher [:40])
+    # — der Nutzer soll eine klare Fehlermeldung sehen, statt dass sein
+    # Name unbemerkt gekürzt gespeichert wird.
+    public_name = (data.get("public_name") or "").strip()
     opt_in = bool(data.get("opt_in"))
     if not email:
         return jsonify({"ok": False, "error": "missing email"}), 400
@@ -1385,10 +1393,25 @@ def helper_set_public():
         return jsonify({"ok": False, "error": "not a helper"}), 403
     if opt_in and not public_name:
         return jsonify({"ok": False, "error": "missing public_name"}), 400
+    if opt_in and len(public_name) > HONOR_NAME_MAX_LEN:
+        return jsonify({"ok": False, "error": "name_too_long"}), 400
     if opt_in and _blocked_public_name(public_name):
         return jsonify({"ok": False, "error": "inappropriate_name"}), 400
 
     conn = db()
+    # 🗑 Max. EIN Anzeigename gleichzeitig aktiv pro Helfer: ein bereits
+    # aktiver Name muss zuerst entfernt werden (opt_in=False), bevor ein
+    # neuer gesetzt werden kann — verhindert ein direktes "Überschreiben"
+    # auf Server-Seite, auch falls die App-Oberfläche das je umgehen
+    # sollte (z. B. veraltete App-Version).
+    if opt_in:
+        row = conn.execute(
+            "SELECT helper_public_name, helper_public_optin "
+            "FROM accounts WHERE email = ?", (email,)).fetchone()
+        if row and row[1] == "1" and row[0] and row[0] != public_name:
+            conn.close()
+            return jsonify({"ok": False, "error": "already_set"}), 409
+
     conn.execute(
         "UPDATE accounts SET helper_public_name = ?, "
         "helper_public_optin = ? WHERE email = ?",
