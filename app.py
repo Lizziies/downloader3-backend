@@ -155,9 +155,12 @@ def db():
     # (NICHT der echten E-Mail-Adresse) auf der Landingpage genannt zu
     # werden — helper_public_optin "1"/"0", helper_public_name ist frei
     # wählbar und komplett getrennt vom privaten In-App-Namen.
+    # 🤝 pre_helper_premium_until: sichert den Premium-Stand VOR einer
+    # Helfer-Beförderung — beim Zurückstufen wird er wiederhergestellt,
+    # statt einfach komplett zu verfallen (siehe admin_set_helper).
     for col in ("first_seen", "last_seen", "role", "last_helper_code_at",
                 "password_hash", "helper_public_name",
-                "helper_public_optin"):
+                "helper_public_optin", "pre_helper_premium_until"):
         try:
             conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
@@ -1152,13 +1155,49 @@ def admin_delete_account():
     return jsonify({"ok": True})
 
 
+def _snapshot_pre_helper_premium(email):
+    """🤝 KERN-FIX: sichert den Premium-Stand VOR einer Helfer-
+    Beförderung (z. B. "noch 4 Tage übrig") in einer eigenen Spalte,
+    bevor er durch das Helfer-Bonus-"forever" überschrieben wird. So
+    kann eine spätere Zurückstufung ihn wiederherstellen, statt das
+    ursprünglich bezahlte/geschenkte Premium einfach verfallen zu
+    lassen. Wird NUR bei einer ECHTEN Neu-Beförderung aufgerufen (siehe
+    Aufrufer) — sonst würde ein zweiter Beförderungs-Versuch den
+    Snapshot fälschlich mit "forever" überschreiben."""
+    now = datetime.datetime.now().isoformat()
+    conn = db()
+    row = conn.execute(
+        "SELECT premium_until FROM accounts WHERE email = ?", (email,)
+    ).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE accounts SET pre_helper_premium_until = ? WHERE email = ?",
+            (row[0] or "", email))
+    else:
+        conn.execute(
+            "INSERT INTO accounts (email, premium_until, updated_at, "
+            "first_seen, last_seen, pre_helper_premium_until) "
+            "VALUES (?, NULL, ?, ?, ?, ?)",
+            (email, now, now, now, ""))
+    conn.commit()
+    conn.close()
+
+
 @app.route("/api/admin-set-helper", methods=["POST", "OPTIONS"])
 def admin_set_helper():
     """🤝 Owner-only: befördert eine E-Mail-Adresse weltweit zum
     Helfer-Rang (oder stuft sie wieder zurück). Helfer bekommen
     automatisch unbegrenztes Premium und dürfen alle 2 Wochen selbst
     einen kleinen Gutscheincode (max. 5 Tage) erstellen — siehe
-    /api/helper-create-code."""
+    /api/helper-create-code.
+
+    🌍 KERN-FIX: beim Zurückstufen wird das "unbegrenzt"-Premium NICHT
+    mehr einfach komplett entfernt, sondern der Premium-Stand von VOR
+    der Beförderung wiederhergestellt (z. B. laufen noch übrige 4 Tage
+    Premium nach der Zurückstufung normal weiter, statt zu verfallen).
+    Außerdem wird die Ehrentafel-Eintragung (Opt-in + Anzeigename)
+    gelöscht — ein zurückgestufter Ex-Helfer darf dort nicht weiter als
+    Helfer auftauchen."""
     if request.method == "OPTIONS":
         return "", 204
     data = request.get_json(force=True) or {}
@@ -1178,6 +1217,10 @@ def admin_set_helper():
     email_sent = True
     email_error = None
     if promote:
+        if _get_role(email) != "helper":
+            # Nur bei einer ECHTEN Neu-Beförderung sichern (siehe
+            # Docstring von _snapshot_pre_helper_premium).
+            _snapshot_pre_helper_premium(email)
         _set_role(email, "helper")
         _upsert_premium(email, "forever")  # Helfer = unbegrenzt Premium
         # 🎉 Genau wie beim Premium-Verschenken (admin-grant-premium) bekommt
@@ -1193,7 +1236,19 @@ def admin_set_helper():
             email_sent = False
             email_error = "email not configured"
     else:
-        _set_role(email, None)
+        conn = db()
+        row = conn.execute(
+            "SELECT pre_helper_premium_until FROM accounts WHERE email = ?",
+            (email,)).fetchone()
+        # "" (bewusst gespeichert für "hatte vorher kein Premium") -> None
+        restore_value = (row[0] if row else "") or None
+        conn.execute(
+            "UPDATE accounts SET role = NULL, premium_until = ?, "
+            "pre_helper_premium_until = NULL, helper_public_name = NULL, "
+            "helper_public_optin = '0', updated_at = ? WHERE email = ?",
+            (restore_value, datetime.datetime.now().isoformat(), email))
+        conn.commit()
+        conn.close()
     return jsonify({"ok": True, "role": "helper" if promote else None,
                     "email_sent": email_sent, "email_error": email_error})
 
@@ -1282,6 +1337,36 @@ def helper_create_code():
     return jsonify({"ok": True, "code": code, "days": days})
 
 
+# 🛡 Ehrentafel-Filter: verhindert, dass jemand Schimpfwörter/Beleidigungen
+# als "Anzeigename" auf der öffentlichen Webseite platziert. Bewusst nur
+# eine Basisliste gängiger deutscher/englischer Schimpfwort-Fragmente —
+# kein Anspruch auf Vollständigkeit (ein perfekter Filter ist unmöglich),
+# aber deckt die offensichtlichsten Fälle zuverlässig ab. Case-insensitive
+# Teilstring-Prüfung, dazu ein paar strukturelle Checks (E-Mail-Adresse,
+# nur Sonderzeichen usw.).
+_BLOCKED_NAME_FRAGMENTS = {
+    "fuck", "shit", "bitch", "asshole", "cunt", "nigger", "nigga",
+    "retard", "faggot", "whore", "slut",
+    "hurensohn", "wichser", "arschloch", "fotze", "schlampe", "hure",
+    "spast", "spasti", "missgeburt", "nazi", "hitler", "scheisse",
+    "scheiße", "kanake", "mongo",
+}
+
+
+def _blocked_public_name(text):
+    """Gibt True zurück, wenn der Anzeigename abgelehnt werden soll."""
+    t = text.strip().lower()
+    if not t:
+        return False
+    if "@" in t:  # sieht aus wie eine E-Mail-Adresse -> ablehnen
+        return True
+    compact = re.sub(r"[^a-z0-9]", "", t)  # Leetspeak/Trennzeichen umgehen
+    for frag in _BLOCKED_NAME_FRAGMENTS:
+        if frag in t or frag in compact:
+            return True
+    return False
+
+
 @app.route("/api/helper-set-public", methods=["POST", "OPTIONS"])
 def helper_set_public():
     """🤝 Ehrentafel: ein Helfer entscheidet hier freiwillig (Opt-in), ob
@@ -1300,6 +1385,8 @@ def helper_set_public():
         return jsonify({"ok": False, "error": "not a helper"}), 403
     if opt_in and not public_name:
         return jsonify({"ok": False, "error": "missing public_name"}), 400
+    if opt_in and _blocked_public_name(public_name):
+        return jsonify({"ok": False, "error": "inappropriate_name"}), 400
 
     conn = db()
     conn.execute(
