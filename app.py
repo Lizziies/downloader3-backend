@@ -143,7 +143,15 @@ def db():
     # Gutscheincode erstellt hat — für die 2-Wochen-Abklingzeit, serverseitig
     # geprüft (nicht nur lokal in der App), damit sie weltweit gilt und
     # sich nicht durch Neuinstallation umgehen lässt.
-    for col in ("first_seen", "last_seen", "role", "last_helper_code_at"):
+    # 🌍 password_hash: NEU — macht Konten server-seitig
+    # authentifizierbar (siehe /api/account-register, /api/account-login
+    # weiter unten), damit ein Konto von JEDEM Gerät aus nutzbar ist und
+    # nicht mehr verloren geht, nur weil die lokalen App-Daten fehlen
+    # (Neuinstallation, App-Update, neues Gerät o. Ä.). Enthält NIE das
+    # Klartext-Passwort — nur den bereits in der App gehashten Wert
+    # (SHA-256, exakt wie zuvor schon lokal gespeichert).
+    for col in ("first_seen", "last_seen", "role", "last_helper_code_at",
+                "password_hash"):
         try:
             conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
@@ -415,6 +423,108 @@ def account_status():
     conn.close()
     return jsonify({"premium_until": row[0] if row else None,
                     "role": (row[1] if row else None) or None})
+
+
+_account_attempts = {}  # Missbrauchsschutz für Login/Registrierung pro E-Mail
+
+
+def _rate_check(email, max_attempts=10, window=600):
+    """Einfacher Schutz gegen Brute-Force auf /account-login und
+    /account-register — max. `max_attempts` Versuche pro E-Mail innerhalb
+    von `window` Sekunden (In-Memory, wie die anderen Limiter hier)."""
+    now = datetime.datetime.now()
+    attempts = [t for t in _account_attempts.get(email, [])
+               if (now - t).total_seconds() < window]
+    limited = len(attempts) >= max_attempts
+    attempts.append(now)
+    _account_attempts[email] = attempts
+    return limited
+
+
+@app.route("/api/account-register", methods=["POST", "OPTIONS"])
+def account_register():
+    """🌍 KERN-FIX: registriert eine E-Mail+Passwort-Kombination
+    SERVERSEITIG, statt nur lokal auf dem Gerät. Vorher waren Konten rein
+    lokal (pro Gerät) gespeichert — nach einer Neuinstallation, einem
+    App-Update, das die lokalen Daten zurücksetzte, oder auf einem
+    zweiten Gerät "verschwand" das Konto scheinbar, obwohl es in der
+    weltweiten Nutzerliste (Owner-Admin) längst auftauchte. Jetzt prüft
+    die Registrierung zuerst hier: ist die E-Mail server-seitig schon mit
+    einem Passwort belegt, schlägt die Registrierung ab ("exists") —
+    andernfalls wird sie hier hinterlegt und ist ab sofort von JEDEM
+    Gerät aus nutzbar. Das Passwort selbst verlässt das Gerät nie im
+    Klartext, nur der (bereits in der App erzeugte) SHA-256-Hash wird
+    hier gespeichert und verglichen."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    pw_hash = (data.get("password_hash") or "").strip()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"ok": False, "error": "invalid email"}), 400
+    if not pw_hash:
+        return jsonify({"ok": False, "error": "missing password_hash"}), 400
+    if _rate_check(email, max_attempts=10, window=600):
+        return jsonify({"ok": False, "error": "too many attempts"}), 429
+
+    conn = db()
+    row = conn.execute(
+        "SELECT password_hash FROM accounts WHERE email = ?", (email,)
+    ).fetchone()
+    if row and row[0]:
+        conn.close()
+        return jsonify({"ok": False, "error": "exists"}), 409
+
+    now = datetime.datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO accounts (email, premium_until, updated_at, "
+        "first_seen, last_seen, password_hash) "
+        "VALUES (?, NULL, ?, ?, ?, ?) "
+        "ON CONFLICT(email) DO UPDATE SET "
+        "password_hash=excluded.password_hash, "
+        "updated_at=excluded.updated_at, last_seen=excluded.last_seen",
+        (email, now, now, now, pw_hash))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/account-login", methods=["POST", "OPTIONS"])
+def account_login():
+    """🌍 Prüft E-Mail+Passwort GEGEN DEN SERVER (statt nur lokal) — so
+    kann sich jeder von JEDEM Gerät aus einloggen, auch wenn die lokalen
+    App-Daten fehlen (neues Gerät, Neuinstallation, App-Update, o. Ä.).
+    Meldet bewusst nur zwei mögliche Fehler zurück ("no_account" /
+    "wrong_password"), damit die App darauf reagieren kann — die
+    eigentliche Anzeige in der App bleibt trotzdem generisch ("E-Mail
+    oder Passwort ist falsch"), um nicht zu verraten, ob eine E-Mail
+    überhaupt existiert."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    pw_hash = (data.get("password_hash") or "").strip()
+    if not email or not pw_hash:
+        return jsonify({"ok": False, "error": "invalid request"}), 400
+    if _rate_check(email, max_attempts=15, window=600):
+        return jsonify({"ok": False, "error": "too many attempts"}), 429
+
+    conn = db()
+    row = conn.execute(
+        "SELECT password_hash, premium_until, role FROM accounts "
+        "WHERE email = ?", (email,)).fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return jsonify({"ok": False, "error": "no_account"}), 404
+    if row[0] != pw_hash:
+        conn.close()
+        return jsonify({"ok": False, "error": "wrong_password"}), 401
+    now = datetime.datetime.now().isoformat()
+    conn.execute("UPDATE accounts SET last_seen = ? WHERE email = ?",
+                (now, email))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "premium_until": row[1], "role": row[2]})
 
 
 _owner_attempts = {}  # simple In-Memory-Schutz gegen wiederholtes Ausprobieren
