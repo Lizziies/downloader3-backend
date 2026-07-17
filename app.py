@@ -150,8 +150,14 @@ def db():
     # (Neuinstallation, App-Update, neues Gerät o. Ä.). Enthält NIE das
     # Klartext-Passwort — nur den bereits in der App gehashten Wert
     # (SHA-256, exakt wie zuvor schon lokal gespeichert).
+    # 🤝 Ehrentafel: Helfer können sich im Helfer-Tab der App freiwillig
+    # (Opt-in) dafür entscheiden, mit einem selbst gewählten Anzeigenamen
+    # (NICHT der echten E-Mail-Adresse) auf der Landingpage genannt zu
+    # werden — helper_public_optin "1"/"0", helper_public_name ist frei
+    # wählbar und komplett getrennt vom privaten In-App-Namen.
     for col in ("first_seen", "last_seen", "role", "last_helper_code_at",
-                "password_hash"):
+                "password_hash", "helper_public_name",
+                "helper_public_optin"):
         try:
             conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
@@ -418,11 +424,14 @@ def account_status():
     _touch_account(email)  # merkt sich: diese E-Mail nutzt die App
     conn = db()
     row = conn.execute(
-        "SELECT premium_until, role FROM accounts WHERE email = ?", (email,)
+        "SELECT premium_until, role, helper_public_name, "
+        "helper_public_optin FROM accounts WHERE email = ?", (email,)
     ).fetchone()
     conn.close()
     return jsonify({"premium_until": row[0] if row else None,
-                    "role": (row[1] if row else None) or None})
+                    "role": (row[1] if row else None) or None,
+                    "helper_public_name": (row[2] if row else None) or "",
+                    "helper_public_optin": bool(row and row[3] == "1")})
 
 
 _account_attempts = {}  # Missbrauchsschutz für Login/Registrierung pro E-Mail
@@ -1139,6 +1148,117 @@ def helper_create_code():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "code": code, "days": days})
+
+
+@app.route("/api/helper-set-public", methods=["POST", "OPTIONS"])
+def helper_set_public():
+    """🤝 Ehrentafel: ein Helfer entscheidet hier freiwillig (Opt-in), ob
+    und mit welchem selbst gewählten Anzeigenamen er auf der Landingpage
+    genannt wird — komplett getrennt vom privaten In-App-Namen, NIE die
+    echte E-Mail-Adresse. Nur für Konten mit Rang 'helper'."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    public_name = (data.get("public_name") or "").strip()[:40]
+    opt_in = bool(data.get("opt_in"))
+    if not email:
+        return jsonify({"ok": False, "error": "missing email"}), 400
+    if _get_role(email) != "helper":
+        return jsonify({"ok": False, "error": "not a helper"}), 403
+    if opt_in and not public_name:
+        return jsonify({"ok": False, "error": "missing public_name"}), 400
+
+    conn = db()
+    conn.execute(
+        "UPDATE accounts SET helper_public_name = ?, "
+        "helper_public_optin = ? WHERE email = ?",
+        (public_name, "1" if opt_in else "0", email))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/helpers-public", methods=["GET"])
+def helpers_public():
+    """🤝 Öffentlich (keine Anmeldung nötig) — für die Ehrentafel auf der
+    Landingpage. Gibt NUR die selbst gewählten Anzeigenamen der Helfer
+    zurück, die sich aktiv fürs Zeigen entschieden haben (Opt-in) — NIE
+    E-Mail-Adressen oder andere Kontodaten."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT helper_public_name FROM accounts WHERE role = 'helper' "
+        "AND helper_public_optin = '1' AND helper_public_name IS NOT NULL "
+        "AND helper_public_name != '' ORDER BY first_seen ASC"
+    ).fetchall()
+    conn.close()
+    return jsonify({"helpers": [r[0] for r in rows]})
+
+
+def _beta_email_text(zip_url, note):
+    """🧪 Bilinguale Beta-Test-E-Mail an alle Helfer — der Server kennt
+    die bevorzugte Sprache eines Nutzers nicht, deshalb steht hier
+    bewusst IMMER Deutsch UND Englisch im selben Text."""
+    subject = "🧪 Downloader<3 Beta-Test — sei als Erste(r) dabei! / Be the first to test!"
+    extra = f"\n\n📝 {note}\n" if note else ""
+    body = (
+        "Hey! 🎉\n\n"
+        "Du bist Helfer bei Downloader<3 — und weil du das bist, darfst du "
+        "die neueste Beta-Version schon jetzt testen, bevor sie für alle "
+        "anderen veröffentlicht wird!\n\n"
+        f"⬇ Download: {zip_url}"
+        f"{extra}\n"
+        "Danke, dass du uns hilfst, Downloader<3 noch besser zu machen! 💜\n\n"
+        "---\n\n"
+        "Hey! 🎉 (English)\n\n"
+        "You're a Helper on Downloader<3 — and because of that, you get to "
+        "try out the newest beta version before anyone else!\n\n"
+        f"⬇ Download: {zip_url}"
+        f"{extra}\n"
+        "Thanks for helping us make Downloader<3 even better! 💜"
+    )
+    return subject, body
+
+
+@app.route("/api/admin-broadcast-beta", methods=["POST", "OPTIONS"])
+def admin_broadcast_beta():
+    """🧪 Owner-only: schickt eine (bewusst automatisch generierte)
+    Beta-Test-Einladung samt Download-Link an ALLE aktuellen Helfer
+    weltweit auf einmal — z. B. bevor eine neue Version öffentlich
+    veröffentlicht wird. Der eigentliche Build wird bewusst NICHT als
+    E-Mail-Anhang verschickt (30+ MB sprengen die meisten Postfach-/
+    SMTP-Limits zuverlässig), sondern als Link (z. B. ein GitHub-
+    Pre-Release-Asset-Link)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(force=True) or {}
+    owner_password = data.get("owner_password") or ""
+    if not OWNER_PASSWORD or owner_password != OWNER_PASSWORD:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    zip_url = (data.get("zip_url") or "").strip()
+    note = (data.get("note") or "").strip()
+    if not zip_url:
+        return jsonify({"ok": False, "error": "missing zip_url"}), 400
+    if not _email_configured():
+        return jsonify({"ok": False, "error": "email not configured"}), 503
+
+    conn = db()
+    rows = conn.execute(
+        "SELECT email FROM accounts WHERE role = 'helper'").fetchall()
+    conn.close()
+    emails = [r[0] for r in rows if r[0]]
+
+    subject, body = _beta_email_text(zip_url, note)
+    sent = 0
+    failed = []
+    for addr in emails:
+        try:
+            _smtp_send(addr, subject, body)
+            sent += 1
+        except Exception as e:
+            failed.append({"email": addr, "error": str(e)})
+    return jsonify({"ok": True, "total": len(emails), "sent": sent,
+                    "failed": failed})
 
 
 def _check_ai_rate_limit(identifier, max_per_hour):
